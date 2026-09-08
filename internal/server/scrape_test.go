@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/ZoOwen/loker-id/internal/scraper"
 )
 
@@ -89,25 +91,95 @@ func TestHandleTriggerScrape_ValidRequestReturns202AndRunsInBackground(t *testin
 		t.Errorf("POST took %v, want it to return immediately (work happens in a goroutine)", elapsed)
 	}
 
-	// The run happens in the background; poll briefly for it to land
-	// rather than assuming a fixed sleep is enough.
+	waitForJob(t, pool, "https://kalibrr.com/jobs/triggered")
+}
+
+func TestHandleTriggerScrape_InvalidPagesReturns400(t *testing.T) {
+	cases := []string{"0", "-1", "21", "abc", "3.5", ""}
+
+	for _, pages := range cases {
+		t.Run(pages, func(t *testing.T) {
+			ts, _, _, _ := newTestServer(t)
+			defer ts.Close()
+
+			url := ts.URL + "/internal/scrape?source=kalibrr&pages=" + pages
+			resp := postWithToken(t, url, testInternalToken)
+			defer resp.Body.Close()
+
+			// pages="" (the empty string, as opposed to the param being
+			// omitted entirely) hits the same "empty value" branch as
+			// omitting it, so it's the one case here that's accepted.
+			want := http.StatusBadRequest
+			if pages == "" {
+				want = http.StatusAccepted
+			}
+			if resp.StatusCode != want {
+				t.Errorf("pages=%q: status = %d, want %d", pages, resp.StatusCode, want)
+			}
+		})
+	}
+}
+
+func TestHandleTriggerScrape_ValidPagesThreadsThroughToScraper(t *testing.T) {
+	ts, _, pool, sc := newTestServer(t)
+	defer ts.Close()
+
+	sc.jobs = []scraper.RawJob{
+		{Title: "Backend Engineer", Company: "Acme", SourceURL: "https://kalibrr.com/jobs/pages-test", SourceJobID: "pages-test"},
+	}
+
+	resp := postWithToken(t, ts.URL+"/internal/scrape?source=kalibrr&pages=7", testInternalToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	waitForJob(t, pool, "https://kalibrr.com/jobs/pages-test")
+
+	if got := sc.gotMaxPages.Load(); got != 7 {
+		t.Errorf("scraper received maxPages = %d, want 7", got)
+	}
+}
+
+func TestHandleTriggerScrape_OmittedPagesLetsScraperApplyItsOwnDefault(t *testing.T) {
+	ts, _, pool, sc := newTestServer(t)
+	defer ts.Close()
+
+	sc.jobs = []scraper.RawJob{
+		{Title: "Backend Engineer", Company: "Acme", SourceURL: "https://kalibrr.com/jobs/no-pages-test", SourceJobID: "no-pages-test"},
+	}
+
+	resp := postWithToken(t, ts.URL+"/internal/scrape?source=kalibrr", testInternalToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	waitForJob(t, pool, "https://kalibrr.com/jobs/no-pages-test")
+
+	if got := sc.gotMaxPages.Load(); got != 0 {
+		t.Errorf("scraper received maxPages = %d, want 0 (unset, so the scraper applies its own default)", got)
+	}
+}
+
+// waitForJob polls until a job with the given source_url has landed,
+// since the trigger endpoint runs the scrape in a background goroutine.
+func waitForJob(t *testing.T, pool *pgxpool.Pool, sourceURL string) {
+	t.Helper()
+
 	deadline := time.Now().Add(5 * time.Second)
-	var found bool
 	for time.Now().Before(deadline) {
 		var count int
 		if err := pool.QueryRow(context.Background(),
-			"SELECT count(*) FROM jobs WHERE source_url = $1", "https://kalibrr.com/jobs/triggered",
+			"SELECT count(*) FROM jobs WHERE source_url = $1", sourceURL,
 		).Scan(&count); err != nil {
 			t.Fatalf("count jobs: %v", err)
 		}
 		if count == 1 {
-			found = true
-			break
+			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if !found {
-		t.Fatal("triggered scrape never persisted the job within the timeout")
-	}
+	t.Fatalf("job %q never persisted within the timeout", sourceURL)
 }

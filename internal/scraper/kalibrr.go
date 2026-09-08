@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -39,8 +40,7 @@ const (
 	// opposed to pretending to be a browser.
 	kalibrrUserAgent = "loker-id-bot/1.0 (+https://github.com/ZoOwen/loker-id)"
 
-	defaultKalibrrKeyword  = "software-engineer"
-	defaultKalibrrMaxPages = 20
+	defaultKalibrrKeyword = "software-engineer"
 
 	kalibrrRequestTimeout = 15 * time.Second
 	kalibrrRequestDelay   = 2 * time.Second
@@ -56,9 +56,9 @@ type KalibrrScraper struct {
 	collector      *colly.Collector
 	baseURL        string
 	keyword        string
-	maxPages       int
 	maxRetries     int
 	retryBaseDelay time.Duration
+	logger         *slog.Logger
 
 	mu     sync.Mutex
 	result kalibrrPageResult
@@ -71,24 +71,24 @@ type KalibrrScraper struct {
 type kalibrrConfig struct {
 	baseURL        string
 	keyword        string
-	maxPages       int
 	requestTimeout time.Duration
 	requestDelay   time.Duration
 	randomDelay    time.Duration
 	maxRetries     int
 	retryBaseDelay time.Duration
+	logger         *slog.Logger
 }
 
 func defaultKalibrrConfig() kalibrrConfig {
 	return kalibrrConfig{
 		baseURL:        kalibrrBase,
 		keyword:        defaultKalibrrKeyword,
-		maxPages:       defaultKalibrrMaxPages,
 		requestTimeout: kalibrrRequestTimeout,
 		requestDelay:   kalibrrRequestDelay,
 		randomDelay:    kalibrrRandomDelay,
 		maxRetries:     kalibrrMaxRetries,
 		retryBaseDelay: kalibrrRetryBaseDelay,
+		logger:         slog.Default(),
 	}
 }
 
@@ -115,12 +115,17 @@ func NewKalibrrScraper(keyword string) *KalibrrScraper {
 }
 
 func newKalibrrScraper(cfg kalibrrConfig) *KalibrrScraper {
+	logger := cfg.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	s := &KalibrrScraper{
 		baseURL:        cfg.baseURL,
 		keyword:        cfg.keyword,
-		maxPages:       cfg.maxPages,
 		maxRetries:     cfg.maxRetries,
 		retryBaseDelay: cfg.retryBaseDelay,
+		logger:         logger,
 	}
 
 	// AllowedDomains matches the request's hostname (no port); LimitRule's
@@ -157,22 +162,48 @@ func newKalibrrScraper(cfg kalibrrConfig) *KalibrrScraper {
 
 func (s *KalibrrScraper) Source() string { return kalibrrSource }
 
-func (s *KalibrrScraper) Scrape(ctx context.Context) ([]RawJob, error) {
+func (s *KalibrrScraper) Scrape(ctx context.Context, maxPages int) ([]RawJob, error) {
+	maxPages = ClampMaxPages(maxPages)
+
 	var jobs []RawJob
 	total := -1
+	var prevPageIDs map[string]bool
 
-	for page := 1; page <= s.maxPages; page++ {
+	for page := 1; page <= maxPages; page++ {
 		if err := ctx.Err(); err != nil {
 			return jobs, fmt.Errorf("scraper: kalibrr: %w", err)
 		}
 
+		start := time.Now()
 		pageJobs, count, err := s.fetchPage(ctx, page)
+		duration := time.Since(start)
 		if err != nil {
 			return jobs, fmt.Errorf("scraper: kalibrr: page %d: %w", page, err)
 		}
+
+		s.logger.Info("scraped page",
+			"source", kalibrrSource,
+			"page", page,
+			"jobs_found", len(pageJobs),
+			"duration", duration,
+		)
+
 		if len(pageJobs) == 0 {
+			s.logger.Info("stopping early: empty page", "source", kalibrrSource, "page", page)
 			break
 		}
+
+		// Some sites just keep re-serving the last real page instead of
+		// returning empty once a caller pages past the end. If every job
+		// on this page already appeared on the previous one, there's
+		// nothing new here — stop rather than walking all the way to
+		// maxPages for no reason.
+		pageIDs := kalibrrJobIDSet(pageJobs)
+		if prevPageIDs != nil && kalibrrIsSubsetOf(pageIDs, prevPageIDs) {
+			s.logger.Info("stopping early: page duplicates the previous one", "source", kalibrrSource, "page", page)
+			break
+		}
+		prevPageIDs = pageIDs
 
 		jobs = append(jobs, pageJobs...)
 		total = count
@@ -182,6 +213,28 @@ func (s *KalibrrScraper) Scrape(ctx context.Context) ([]RawJob, error) {
 	}
 
 	return jobs, nil
+}
+
+func kalibrrJobIDSet(jobs []RawJob) map[string]bool {
+	set := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		set[j.SourceJobID] = true
+	}
+	return set
+}
+
+// kalibrrIsSubsetOf reports whether every id in a also appears in b — used
+// to detect "this page's jobs are all duplicates of the previous page",
+// which doesn't require the two pages to be exactly identical (the site
+// could return fewer jobs on a trailing page, all of which were already
+// seen).
+func kalibrrIsSubsetOf(a, b map[string]bool) bool {
+	for id := range a {
+		if !b[id] {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchPage visits one listing page, retrying on 429/5xx with exponential

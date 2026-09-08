@@ -30,11 +30,17 @@ type fakeScraper struct {
 	// point between scraping and the per-job loop, instead of a
 	// timing-based "cancel after N ms" that could flake.
 	onScrape func()
+
+	// gotMaxPages records the maxPages Scrape was actually called with,
+	// so a test can assert Pipeline.Run threads its own maxPages
+	// argument through unchanged.
+	gotMaxPages int
 }
 
 func (f *fakeScraper) Source() string { return f.slug }
 
-func (f *fakeScraper) Scrape(ctx context.Context) ([]scraper.RawJob, error) {
+func (f *fakeScraper) Scrape(ctx context.Context, maxPages int) ([]scraper.RawJob, error) {
+	f.gotMaxPages = maxPages
 	if f.onScrape != nil {
 		f.onScrape()
 	}
@@ -67,6 +73,19 @@ func rawJob(sourceURL, title, company string) scraper.RawJob {
 	}
 }
 
+func TestRun_ThreadsMaxPagesThroughToTheScraperUnchanged(t *testing.T) {
+	sc := &fakeScraper{slug: "kalibrr"}
+	p, _, _ := newTestPipeline(t, sc)
+
+	if _, err := p.Run(context.Background(), "kalibrr", 17); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if sc.gotMaxPages != 17 {
+		t.Errorf("scraper received maxPages = %d, want 17", sc.gotMaxPages)
+	}
+}
+
 func TestRun_HappyPath(t *testing.T) {
 	sc := &fakeScraper{slug: "kalibrr", jobs: []scraper.RawJob{
 		rawJob("https://kalibrr.com/jobs/1", "Backend Engineer", "Acme"),
@@ -75,7 +94,7 @@ func TestRun_HappyPath(t *testing.T) {
 	p, st, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -139,7 +158,7 @@ func TestRun_StoresSanitizedDescriptionNotRawHTML(t *testing.T) {
 	p, _, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	if _, err := p.Run(ctx, "kalibrr"); err != nil {
+	if _, err := p.Run(ctx, "kalibrr", 3); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
@@ -165,7 +184,7 @@ func TestRun_DetectsDuplicates(t *testing.T) {
 	}}
 	p, _, _ := newTestPipeline(t, sc)
 
-	result, err := p.Run(context.Background(), "kalibrr")
+	result, err := p.Run(context.Background(), "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -183,7 +202,7 @@ func TestRun_UnknownSourceReturnsErrorWithoutCreatingARun(t *testing.T) {
 	p, _, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	_, err := p.Run(ctx, "does-not-exist")
+	_, err := p.Run(ctx, "does-not-exist", 3)
 	if err == nil {
 		t.Fatal("Run() error = nil, want an error for an unregistered source slug")
 	}
@@ -219,7 +238,7 @@ func TestRun_OneJobFailingDoesNotStopOthers(t *testing.T) {
 	p, _, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil (per-job failures must not fail Run itself)", err)
 	}
@@ -270,7 +289,7 @@ func TestRun_ScraperFailsCompletely(t *testing.T) {
 	p, _, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil (the failure is reported via RunResult, not as Run's own error)", err)
 	}
@@ -301,7 +320,7 @@ func TestRun_ScraperFailsPartway_StillProcessesWhatItCollected(t *testing.T) {
 	p, _, pool := newTestPipeline(t, sc)
 	ctx := context.Background()
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -364,7 +383,7 @@ func TestRun_DeactivatesStaleJobsFromAnyPreviousRun(t *testing.T) {
 		t.Fatalf("backdate stale job: %v", err)
 	}
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -393,7 +412,7 @@ func TestRun_FailsCleanlyWithAlreadyCanceledContext(t *testing.T) {
 
 	// Can't even create the scrape_runs row with a dead context — Run
 	// should fail fast and cleanly here, not panic or hang.
-	_, err := p.Run(ctx, "kalibrr")
+	_, err := p.Run(ctx, "kalibrr", 3)
 	if err == nil {
 		t.Fatal("Run() error = nil, want an error for an already-canceled context")
 	}
@@ -416,7 +435,7 @@ func TestRun_CancellationMidLoopStillFinishesTheRunRow(t *testing.T) {
 	sc.onScrape = cancel // cancel right as Scrape returns, before the per-job loop runs
 	p, _, pool := newTestPipeline(t, sc)
 
-	result, err := p.Run(ctx, "kalibrr")
+	result, err := p.Run(ctx, "kalibrr", 3)
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil — a mid-run cancellation is reported via RunResult, and the run row must still be finished", err)
 	}

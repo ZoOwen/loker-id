@@ -82,13 +82,15 @@ type RunResult struct {
 	Duration      time.Duration
 }
 
-// Run scrapes sourceSlug end to end. The returned error is non-nil only
+// Run scrapes sourceSlug end to end, walking up to maxPages of results
+// (maxPages <= 0 or above scraper.MaxPagesCap is clamped by the scraper
+// itself — see scraper.ClampMaxPages). The returned error is non-nil only
 // for a setup failure that prevents the run from starting at all (unknown
 // source, can't create the scrape_runs row) — once a run is underway,
 // problems (a failed job, the scraper erroring partway, a canceled
 // context) are recorded in RunResult.Errors instead of failing Run,
 // exactly so one bad job can't take down the whole run.
-func (p *Pipeline) Run(ctx context.Context, sourceSlug string) (*RunResult, error) {
+func (p *Pipeline) Run(ctx context.Context, sourceSlug string, maxPages int) (*RunResult, error) {
 	start := time.Now()
 
 	sc, ok := p.scrapers[sourceSlug]
@@ -107,11 +109,11 @@ func (p *Pipeline) Run(ctx context.Context, sourceSlug string) (*RunResult, erro
 	}
 
 	logger := p.logger.With("source", sourceSlug, "scrape_run_id", runID.String())
-	logger.Info("scrape run started")
+	logger.Info("scrape run started", "max_pages", maxPages)
 
 	result := &RunResult{SourceSlug: sourceSlug, ScrapeRunID: runID}
 
-	rawJobs, scrapeErr := sc.Scrape(ctx)
+	rawJobs, scrapeErr := sc.Scrape(ctx, maxPages)
 	result.JobsFound = len(rawJobs)
 	if scrapeErr != nil {
 		logger.Error("scraper reported an error", "error", scrapeErr, "jobs_collected", len(rawJobs))

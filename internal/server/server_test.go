@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,11 +24,20 @@ type fakeScraper struct {
 	slug string
 	jobs []scraper.RawJob
 	err  error
+
+	// gotMaxPages records the maxPages Scrape was actually called with,
+	// so a test can assert the "pages" query param made it all the way
+	// through the handler and pipeline unchanged. It's an atomic because
+	// the handler runs Scrape in a background goroutine — a test reads
+	// this from a different goroutine, after polling for some other
+	// side effect (e.g. a persisted job row) to know the run finished.
+	gotMaxPages atomic.Int32
 }
 
 func (f *fakeScraper) Source() string { return f.slug }
 
-func (f *fakeScraper) Scrape(ctx context.Context) ([]scraper.RawJob, error) {
+func (f *fakeScraper) Scrape(ctx context.Context, maxPages int) ([]scraper.RawJob, error) {
+	f.gotMaxPages.Store(int32(maxPages))
 	return f.jobs, f.err
 }
 

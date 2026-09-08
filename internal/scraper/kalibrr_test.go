@@ -3,6 +3,8 @@ package scraper
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +25,7 @@ func testConfig(server *httptest.Server) kalibrrConfig {
 	cfg.requestTimeout = 5 * time.Second
 	cfg.retryBaseDelay = 5 * time.Millisecond
 	cfg.maxRetries = 3
+	cfg.logger = testLogger()
 	return cfg
 }
 
@@ -30,25 +33,56 @@ func nextDataPage(count int, jobsJSON string) string {
 	return fmt.Sprintf(`<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"count":%d,"jobs":[%s]}}}</script></body></html>`, count, jobsJSON)
 }
 
-const sampleJobJSON = `{
-	"id": 999,
-	"name": "Backend Engineer",
-	"companyName": "PT Contoh",
-	"company": {"code": "contoh"},
-	"slug": "backend-engineer",
-	"description": "<p>desc</p>",
-	"qualifications": "<p>quals</p>",
-	"baseSalary": 5000000,
-	"maximumSalary": 8000000,
-	"salaryCurrency": "IDR",
-	"salaryInterval": "month",
-	"salaryShown": true,
-	"isHybrid": true,
-	"isWorkFromHome": false,
-	"createdAt": "2026-01-01T00:00:00.000000+00:00",
-	"activationDate": "2026-01-02T03:04:05.123456+00:00",
-	"googleLocation": {"addressComponents": {"city": "Bandung", "country": "Indonesia"}}
-}`
+// sampleJobJSON builds one job's __NEXT_DATA__ JSON with the given id —
+// a function rather than a fixed constant so multi-page tests can give
+// each page distinct (or, where a test wants it, deliberately identical)
+// job ids, since SourceJobID is derived straight from "id".
+func sampleJobJSON(id int) string {
+	return fmt.Sprintf(`{
+		"id": %d,
+		"name": "Backend Engineer",
+		"companyName": "PT Contoh",
+		"company": {"code": "contoh"},
+		"slug": "backend-engineer",
+		"description": "<p>desc</p>",
+		"qualifications": "<p>quals</p>",
+		"baseSalary": 5000000,
+		"maximumSalary": 8000000,
+		"salaryCurrency": "IDR",
+		"salaryInterval": "month",
+		"salaryShown": true,
+		"isHybrid": true,
+		"isWorkFromHome": false,
+		"createdAt": "2026-01-01T00:00:00.000000+00:00",
+		"activationDate": "2026-01-02T03:04:05.123456+00:00",
+		"googleLocation": {"addressComponents": {"city": "Bandung", "country": "Indonesia"}}
+	}`, id)
+}
+
+// pageNumberFromPath parses the trailing /job-board/te/<keyword>/<page>
+// path segment as an int, for handlers that need to vary their response
+// by requested page.
+func pageNumberFromPath(path string) int {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	n, _ := strconv.Atoi(parts[len(parts)-1])
+	return n
+}
+
+// neverEndingServer always returns one non-empty, page-uniquely-IDed job
+// with a reported total far larger than any test would actually reach —
+// so a test using it is exercising exactly one thing: how many pages
+// Scrape actually walks, driven purely by maxPages (not by hitting an
+// empty page or the reported total).
+func neverEndingServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := pageNumberFromPath(r.URL.Path)
+		w.Write([]byte(nextDataPage(1_000_000, sampleJobJSON(page))))
+	}))
+}
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 func TestKalibrrScraper_Source(t *testing.T) {
 	s := NewKalibrrScraper("")
@@ -60,9 +94,12 @@ func TestKalibrrScraper_Source(t *testing.T) {
 // TestKalibrrScraper_RealFixture replays a page captured live from
 // kalibrr.com/job-board on 2026-09-08 (see testdata/kalibrr_page1.html) to
 // confirm our __NEXT_DATA__ decoding and field mapping actually match the
-// real site's shape, not just a hand-written fixture. The server ignores
-// the requested page and always returns this same 15-job/count-37 page, so
-// Scrape should paginate exactly 3 times (15+15+15=45 >= 37) and stop.
+// real site's shape, not just a hand-written fixture. One page is enough
+// to verify that; multi-page walking behavior (aggregation, maxPages,
+// stopping early) is covered separately with fixtures this test can
+// control precisely — this fixture always contains the same 15 jobs no
+// matter which page is requested, which would otherwise trip the
+// "page duplicates the previous one" early-stop after page 1.
 func TestKalibrrScraper_RealFixture(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/kalibrr_page1.html")
 	if err != nil {
@@ -78,16 +115,16 @@ func TestKalibrrScraper_RealFixture(t *testing.T) {
 	defer server.Close()
 
 	s := newKalibrrScraper(testConfig(server))
-	jobs, err := s.Scrape(context.Background())
+	jobs, err := s.Scrape(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("Scrape() error = %v", err)
 	}
 
-	if got, want := len(jobs), 45; got != want {
-		t.Errorf("len(jobs) = %d, want %d (3 pages x 15)", got, want)
+	if got, want := len(jobs), 15; got != want {
+		t.Errorf("len(jobs) = %d, want %d (one page)", got, want)
 	}
-	if got := atomic.LoadInt32(&requests); got != 3 {
-		t.Errorf("requests = %d, want 3", got)
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("requests = %d, want 1", got)
 	}
 
 	first := jobs[0]
@@ -142,7 +179,7 @@ func TestKalibrrScraper_MissingNextData(t *testing.T) {
 	defer server.Close()
 
 	s := newKalibrrScraper(testConfig(server))
-	jobs, err := s.Scrape(context.Background())
+	jobs, err := s.Scrape(context.Background(), 3)
 
 	if err == nil {
 		t.Fatal("Scrape() error = nil, want an error about missing __NEXT_DATA__")
@@ -166,12 +203,12 @@ func TestKalibrrScraper_RetriesOn429(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		w.Write([]byte(nextDataPage(1, sampleJobJSON)))
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(999))))
 	}))
 	defer server.Close()
 
 	s := newKalibrrScraper(testConfig(server))
-	jobs, err := s.Scrape(context.Background())
+	jobs, err := s.Scrape(context.Background(), 3)
 	if err != nil {
 		t.Fatalf("Scrape() error = %v", err)
 	}
@@ -198,7 +235,7 @@ func TestKalibrrScraper_GivesUpAfterMaxRetries(t *testing.T) {
 
 	cfg := testConfig(server)
 	s := newKalibrrScraper(cfg)
-	_, err := s.Scrape(context.Background())
+	_, err := s.Scrape(context.Background(), 3)
 	if err == nil {
 		t.Fatal("Scrape() error = nil, want an error after exhausting retries")
 	}
@@ -209,13 +246,14 @@ func TestKalibrrScraper_GivesUpAfterMaxRetries(t *testing.T) {
 
 // TestKalibrrScraper_StopsOnEmptyPage checks that pagination stops as soon
 // as a page comes back with zero jobs, even if the (possibly stale) count
-// field would otherwise suggest more pages exist.
+// field would otherwise suggest more pages exist, and well before
+// maxPages would have.
 func TestKalibrrScraper_StopsOnEmptyPage(t *testing.T) {
 	var requests int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&requests, 1)
 		if n == 1 {
-			w.Write([]byte(nextDataPage(999, sampleJobJSON)))
+			w.Write([]byte(nextDataPage(999, sampleJobJSON(1))))
 			return
 		}
 		w.Write([]byte(nextDataPage(999, "")))
@@ -223,7 +261,7 @@ func TestKalibrrScraper_StopsOnEmptyPage(t *testing.T) {
 	defer server.Close()
 
 	s := newKalibrrScraper(testConfig(server))
-	jobs, err := s.Scrape(context.Background())
+	jobs, err := s.Scrape(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("Scrape() error = %v", err)
 	}
@@ -231,7 +269,7 @@ func TestKalibrrScraper_StopsOnEmptyPage(t *testing.T) {
 		t.Errorf("len(jobs) = %d, want 1", len(jobs))
 	}
 	if got := atomic.LoadInt32(&requests); got != 2 {
-		t.Errorf("requests = %d, want 2 (page 1 with a job, page 2 empty)", got)
+		t.Errorf("requests = %d, want 2 (page 1 with a job, page 2 empty) — must not keep going to maxPages", got)
 	}
 }
 
@@ -241,7 +279,7 @@ func TestKalibrrScraper_ContextCancellation(t *testing.T) {
 	var requests int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requests, 1)
-		w.Write([]byte(nextDataPage(1, sampleJobJSON)))
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(999))))
 	}))
 	defer server.Close()
 
@@ -249,7 +287,7 @@ func TestKalibrrScraper_ContextCancellation(t *testing.T) {
 	cancel()
 
 	s := newKalibrrScraper(testConfig(server))
-	_, err := s.Scrape(ctx)
+	_, err := s.Scrape(ctx, 3)
 	if err == nil {
 		t.Fatal("Scrape() error = nil, want context canceled error")
 	}
@@ -260,13 +298,14 @@ func TestKalibrrScraper_ContextCancellation(t *testing.T) {
 
 func TestKalibrrScraper_MultiplePagesAggregate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /job-board/te/<keyword>/<page>
-		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		page, _ := strconv.Atoi(parts[len(parts)-1])
-
+		page := pageNumberFromPath(r.URL.Path)
 		switch page {
 		case 1, 2:
-			w.Write([]byte(nextDataPage(2, sampleJobJSON)))
+			// Distinct ids per page: two different real jobs, not the
+			// same one repeated — a repeated id would (correctly) trip
+			// the "page duplicates the previous one" early-stop this
+			// same file tests separately below.
+			w.Write([]byte(nextDataPage(2, sampleJobJSON(page))))
 		default:
 			w.Write([]byte(nextDataPage(2, "")))
 		}
@@ -274,11 +313,132 @@ func TestKalibrrScraper_MultiplePagesAggregate(t *testing.T) {
 	defer server.Close()
 
 	s := newKalibrrScraper(testConfig(server))
-	jobs, err := s.Scrape(context.Background())
+	jobs, err := s.Scrape(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("Scrape() error = %v", err)
 	}
 	if len(jobs) != 2 {
 		t.Errorf("len(jobs) = %d, want 2 (stops once accumulated >= count)", len(jobs))
+	}
+}
+
+// TestKalibrrScraper_MaxPagesZeroDefaultsToThree checks that Scrape
+// applies scraper.DefaultMaxPages when called with maxPages <= 0.
+func TestKalibrrScraper_MaxPagesZeroDefaultsToThree(t *testing.T) {
+	server := neverEndingServer()
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	jobs, err := s.Scrape(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+	if len(jobs) != DefaultMaxPages {
+		t.Errorf("len(jobs) = %d, want %d (one job per page, DefaultMaxPages pages)", len(jobs), DefaultMaxPages)
+	}
+}
+
+// TestKalibrrScraper_MaxPagesRespected checks that an explicit in-range
+// maxPages is honored exactly — neither more pages nor fewer.
+func TestKalibrrScraper_MaxPagesRespected(t *testing.T) {
+	server := neverEndingServer()
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	jobs, err := s.Scrape(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+	if len(jobs) != 5 {
+		t.Errorf("len(jobs) = %d, want 5", len(jobs))
+	}
+}
+
+// TestKalibrrScraper_MaxPagesCappedAt20 checks that a maxPages far above
+// the hard cap is clamped down to it — the server here would happily keep
+// paginating forever, so if this didn't clamp, the test would hang making
+// hundreds of requests instead of stopping at 20.
+func TestKalibrrScraper_MaxPagesCappedAt20(t *testing.T) {
+	server := neverEndingServer()
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	jobs, err := s.Scrape(context.Background(), 500)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+	if len(jobs) != MaxPagesCap {
+		t.Errorf("len(jobs) = %d, want %d (MaxPagesCap, not the requested 500)", len(jobs), MaxPagesCap)
+	}
+}
+
+// TestKalibrrScraper_StopsWhenPageExactlyDuplicatesPrevious checks the
+// "job-nya duplikat semua dari halaman sebelumnya" early-stop: a site
+// that just keeps re-serving its last real page instead of returning
+// empty once paged past the end shouldn't be walked all the way to
+// maxPages.
+func TestKalibrrScraper_StopsWhenPageExactlyDuplicatesPrevious(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		page := pageNumberFromPath(r.URL.Path)
+		twoJobs := sampleJobJSON(1) + "," + sampleJobJSON(2)
+		if page == 1 {
+			w.Write([]byte(nextDataPage(999, twoJobs)))
+			return
+		}
+		// Every subsequent page: the exact same two jobs again.
+		w.Write([]byte(nextDataPage(999, twoJobs)))
+	}))
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	jobs, err := s.Scrape(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Errorf("len(jobs) = %d, want 2 (only page 1's jobs — page 2's identical jobs must not be re-appended)", len(jobs))
+	}
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Errorf("requests = %d, want 2 (page 1, then page 2 to discover it's a duplicate — not all the way to maxPages)", got)
+	}
+}
+
+// TestKalibrrScraper_ContinuesWhenPageHasAtLeastOneNewJob checks that the
+// duplicate-page early-stop only fires when a page's jobs are *all*
+// duplicates — a page with even one new job alongside repeats must not be
+// mistaken for the end of real pagination.
+func TestKalibrrScraper_ContinuesWhenPageHasAtLeastOneNewJob(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		page := pageNumberFromPath(r.URL.Path)
+		switch page {
+		case 1:
+			// count is deliberately far above what actually accumulates
+			// (4 raw jobs across pages 1-2, including the repeat) so the
+			// existing "reached the reported total" stop can't kick in
+			// first — page 3 coming back empty must be what stops this.
+			w.Write([]byte(nextDataPage(999, sampleJobJSON(1)+","+sampleJobJSON(2))))
+		case 2:
+			// job 1 repeated, but job 3 is new — not all-duplicate.
+			w.Write([]byte(nextDataPage(999, sampleJobJSON(1)+","+sampleJobJSON(3))))
+		default:
+			w.Write([]byte(nextDataPage(999, "")))
+		}
+	}))
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	jobs, err := s.Scrape(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Errorf("len(jobs) = %d, want 4 (2 from page 1 + 2 from page 2, including the repeat — page 2 wasn't all-duplicate so it's not skipped)", len(jobs))
+	}
+	if got := atomic.LoadInt32(&requests); got != 3 {
+		t.Errorf("requests = %d, want 3 (page 3 comes back empty, which is what actually stops it)", got)
 	}
 }
