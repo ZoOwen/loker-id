@@ -4,7 +4,8 @@ export
 MIGRATIONS_DIR := migrations
 
 .PHONY: run build test vet tidy tools \
-	migrate-up migrate-down migrate-status migrate-create sqlc
+	migrate-up migrate-down migrate-status migrate-create sqlc \
+	test-db-setup
 
 run: ## Run the API server
 	go run ./cmd/server
@@ -14,6 +15,19 @@ build: ## Build the API server binary
 
 test: ## Run tests
 	go test ./...
+
+test-db-setup: ## (Re)apply migrations/001_init.sql to TEST_DATABASE_URL for manual inspection (psql, etc).
+	## internal/store's own tests do NOT need this — each test applies the
+	## same file itself into a fresh, isolated schema it drops when done,
+	## so TEST_DATABASE_URL's public schema staying empty between test runs
+	## is expected, not broken. This target is only for looking at a
+	## populated copy directly. Safe to re-run: drops and recreates public
+	## first, since 001_init.sql has no IF NOT EXISTS guards of its own.
+ifndef TEST_DATABASE_URL
+	$(error TEST_DATABASE_URL is not set)
+endif
+	psql "$(TEST_DATABASE_URL)" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+	psql "$(TEST_DATABASE_URL)" -v ON_ERROR_STOP=1 -f $(MIGRATIONS_DIR)/001_init.sql
 
 vet: ## Run go vet
 	go vet ./...

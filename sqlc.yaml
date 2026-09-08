@@ -15,3 +15,10 @@ sql:
         overrides:
           - db_type: "uuid"
             go_type: "github.com/google/uuid.UUID"
+          # tsvector has no default pgx/v5 codec — scanning it into the
+          # otherwise-generated `interface{}` fails outright ("cannot scan
+          # unknown type (OID 3614)"). The app layer never reads this
+          # column (it's trigger-maintained, used only via @@ in SQL), so
+          # a plain string is enough to make it scannable.
+          - column: "jobs.search_vector"
+            go_type: "string"
