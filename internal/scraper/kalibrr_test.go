@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,11 @@ import (
 func testConfig(server *httptest.Server) kalibrrConfig {
 	cfg := defaultKalibrrConfig()
 	cfg.baseURL = server.URL
+	// Single keyword by default: these tests are about per-keyword
+	// pagination behavior (maxPages, early-stop, retries...), not about
+	// aggregating across keywords — that's covered separately by the
+	// TestKalibrrScraper_*Keyword* tests, which override this themselves.
+	cfg.keywords = []string{"test-keyword"}
 	cfg.requestDelay = 0
 	cfg.randomDelay = 0
 	cfg.requestTimeout = 5 * time.Second
@@ -68,6 +74,17 @@ func pageNumberFromPath(path string) int {
 	return n
 }
 
+// keywordFromPath parses the /job-board/te/<keyword>/<page> path's
+// keyword segment, for handlers that need to vary their response by
+// requested keyword.
+func keywordFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2]
+}
+
 // neverEndingServer always returns one non-empty, page-uniquely-IDed job
 // with a reported total far larger than any test would actually reach —
 // so a test using it is exercising exactly one thing: how many pages
@@ -85,9 +102,28 @@ func testLogger() *slog.Logger {
 }
 
 func TestKalibrrScraper_Source(t *testing.T) {
-	s := NewKalibrrScraper("")
+	s := NewKalibrrScraper()
 	if got := s.Source(); got != "kalibrr" {
 		t.Errorf("Source() = %q, want %q", got, "kalibrr")
+	}
+}
+
+func TestKalibrrScraper_NoKeywordsDefaultsToDefaultKalibrrKeywords(t *testing.T) {
+	s := NewKalibrrScraper()
+	if len(s.keywords) != len(DefaultKalibrrKeywords) {
+		t.Fatalf("len(keywords) = %d, want %d (DefaultKalibrrKeywords)", len(s.keywords), len(DefaultKalibrrKeywords))
+	}
+	for i, kw := range DefaultKalibrrKeywords {
+		if s.keywords[i] != kw {
+			t.Errorf("keywords[%d] = %q, want %q", i, s.keywords[i], kw)
+		}
+	}
+}
+
+func TestKalibrrScraper_ExplicitKeywordsOverrideTheDefault(t *testing.T) {
+	s := NewKalibrrScraper("rust", "kotlin")
+	if len(s.keywords) != 2 || s.keywords[0] != "rust" || s.keywords[1] != "kotlin" {
+		t.Errorf("keywords = %v, want [rust kotlin]", s.keywords)
 	}
 }
 
@@ -440,5 +476,97 @@ func TestKalibrrScraper_ContinuesWhenPageHasAtLeastOneNewJob(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requests); got != 3 {
 		t.Errorf("requests = %d, want 3 (page 3 comes back empty, which is what actually stops it)", got)
+	}
+}
+
+// TestKalibrrScraper_ScrapesEveryKeywordAndAggregates checks that Scrape
+// runs a separate search per configured keyword and aggregates every
+// keyword's jobs into one result — the mechanism this scraper now relies
+// on for coverage instead of deep pagination (see the package doc comment
+// in kalibrr.go for why).
+func TestKalibrrScraper_ScrapesEveryKeywordAndAggregates(t *testing.T) {
+	var mu sync.Mutex
+	var requestedKeywords []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keyword := keywordFromPath(r.URL.Path)
+		mu.Lock()
+		requestedKeywords = append(requestedKeywords, keyword)
+		mu.Unlock()
+
+		if pageNumberFromPath(r.URL.Path) > 1 {
+			w.Write([]byte(nextDataPage(1, "")))
+			return
+		}
+		// One job per keyword, id derived from the keyword so each is
+		// distinct and traceable back to its search.
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(len(keyword)))))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server)
+	cfg.keywords = []string{"backend", "golang", "devops"}
+	s := newKalibrrScraper(cfg)
+
+	jobs, err := s.Scrape(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+
+	if len(jobs) != 3 {
+		t.Fatalf("len(jobs) = %d, want 3 (one per keyword)", len(jobs))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, kw := range cfg.keywords {
+		found := false
+		for _, got := range requestedKeywords {
+			if got == kw {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("keyword %q was never requested; requested = %v", kw, requestedKeywords)
+		}
+	}
+}
+
+// TestKalibrrScraper_ContinuesToNextKeywordAfterOneFails checks that a
+// hard failure on one keyword (e.g. the site's response for that search
+// doesn't parse) doesn't abort the whole run — the remaining keywords
+// still get searched, and both the partial jobs and the failure are
+// reported, matching the rest of this codebase's "one bad thing doesn't
+// take down everything" pattern (see Pipeline.Run).
+func TestKalibrrScraper_ContinuesToNextKeywordAfterOneFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keyword := keywordFromPath(r.URL.Path)
+		if keyword == "broken" {
+			w.Write([]byte(`<html><body>no next data here</body></html>`))
+			return
+		}
+		if pageNumberFromPath(r.URL.Path) > 1 {
+			w.Write([]byte(nextDataPage(1, "")))
+			return
+		}
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(len(keyword)))))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server)
+	cfg.keywords = []string{"backend", "broken", "golang"}
+	s := newKalibrrScraper(cfg)
+
+	jobs, err := s.Scrape(context.Background(), 3)
+	if err == nil {
+		t.Fatal("Scrape() error = nil, want an error mentioning the broken keyword")
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("Scrape() error = %q, want it to mention the failing keyword", err.Error())
+	}
+
+	if len(jobs) != 2 {
+		t.Errorf("len(jobs) = %d, want 2 (backend and golang still succeeded)", len(jobs))
 	}
 }

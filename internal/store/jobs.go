@@ -42,11 +42,19 @@ type UpsertJobParams struct {
 	PostedAt    *time.Time
 }
 
-// UpsertJobResult reports what happened to the job: whether it ended up
-// marked as a duplicate (of itself, on this call or a previous one), and
-// of which canonical job.
+// UpsertJobResult reports what happened to the job: whether the row was
+// freshly created by this call (WasInserted) versus an already-known job
+// (same source_id+source_url) being refreshed, and whether it ended up
+// marked as a duplicate of a *different* row (of itself, on this call or a
+// previous one) plus that row's canonical id.
+//
+// A caller counting "how many genuinely new jobs did this run find" wants
+// !WasInserted || IsDuplicate to mean "already known" — both a re-scrape
+// of the same listing and a fresh row that immediately resolves as a
+// fuzzy duplicate of an older one are cases where nothing new landed.
 type UpsertJobResult struct {
 	Job         db.Job
+	WasInserted bool
 	IsDuplicate bool
 	CanonicalID uuid.UUID
 }
@@ -67,7 +75,7 @@ func (s *Store) UpsertJob(ctx context.Context, p UpsertJobParams) (UpsertJobResu
 
 	salaryMin, salaryMax := salaryBoundsToDB(p.Salary)
 
-	job, err := q.UpsertJob(ctx, db.UpsertJobParams{
+	row, err := q.UpsertJob(ctx, db.UpsertJobParams{
 		Title:           p.Title,
 		TitleNormalized: p.TitleNormalized,
 		CompanyID:       p.CompanyID,
@@ -91,7 +99,8 @@ func (s *Store) UpsertJob(ctx context.Context, p UpsertJobParams) (UpsertJobResu
 		return UpsertJobResult{}, fmt.Errorf("store: upsert job: %w", err)
 	}
 
-	result := UpsertJobResult{Job: job}
+	job := upsertRowToJob(row)
+	result := UpsertJobResult{Job: job, WasInserted: row.Inserted}
 
 	if job.CanonicalJobID.Valid {
 		// Already resolved as a duplicate by an earlier scrape; the
@@ -115,6 +124,41 @@ func (s *Store) UpsertJob(ctx context.Context, p UpsertJobParams) (UpsertJobResu
 	}
 
 	return result, nil
+}
+
+// upsertRowToJob drops UpsertJob's extra "inserted" column, leaving the
+// same db.Job shape every other query returns — the rest of this package
+// works with db.Job, and duplicating that field onto every downstream
+// signature just to thread WasInserted through isn't worth it when
+// UpsertJobResult already carries it separately.
+func upsertRowToJob(r db.UpsertJobRow) db.Job {
+	return db.Job{
+		ID:              r.ID,
+		Title:           r.Title,
+		TitleNormalized: r.TitleNormalized,
+		CompanyID:       r.CompanyID,
+		Description:     r.Description,
+		SalaryMin:       r.SalaryMin,
+		SalaryMax:       r.SalaryMax,
+		SalaryCurrency:  r.SalaryCurrency,
+		SalaryConf:      r.SalaryConf,
+		SalaryRaw:       r.SalaryRaw,
+		Stack:           r.Stack,
+		Location:        r.Location,
+		LocationCity:    r.LocationCity,
+		Mode:            r.Mode,
+		Level:           r.Level,
+		SourceID:        r.SourceID,
+		SourceUrl:       r.SourceUrl,
+		SourceJobID:     r.SourceJobID,
+		Fingerprint:     r.Fingerprint,
+		CanonicalJobID:  r.CanonicalJobID,
+		SearchVector:    r.SearchVector,
+		PostedAt:        r.PostedAt,
+		FirstSeenAt:     r.FirstSeenAt,
+		LastSeenAt:      r.LastSeenAt,
+		IsActive:        r.IsActive,
+	}
 }
 
 // nonNilStrings coerces a nil slice to an empty one. jobs.stack is

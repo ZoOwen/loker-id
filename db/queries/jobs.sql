@@ -11,7 +11,13 @@
 -- just id): the store layer needs posted_at/first_seen_at/fingerprint/
 -- company_id/title_normalized right after upserting to run dedup
 -- resolution, and a second SELECT to fetch them would be redundant
--- inside the same transaction.
+-- inside the same transaction. `xmax = 0` is the standard Postgres tell
+-- for "this row was just INSERTed, not UPDATEd via the ON CONFLICT
+-- branch" within the same command — the store layer needs that to tell a
+-- genuinely new job apart from an already-known one being refreshed
+-- (which now happens routinely: the same Kalibrr posting surfaces under
+-- several of our keyword searches, and hits this same conflict target on
+-- its second-and-later occurrence within a single run).
 INSERT INTO jobs (
     title, title_normalized, company_id, description,
     salary_min, salary_max, salary_conf, salary_raw,
@@ -44,7 +50,7 @@ ON CONFLICT (source_id, source_url) DO UPDATE SET
     posted_at         = EXCLUDED.posted_at,
     last_seen_at      = NOW(),
     is_active         = TRUE
-RETURNING *;
+RETURNING *, (xmax = 0) AS inserted;
 
 -- name: FindDuplicateCandidates :many
 -- Other canonical (not-yet-deduped) jobs that look like the same posting

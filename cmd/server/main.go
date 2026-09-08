@@ -43,7 +43,7 @@ func run() error {
 	st := store.New(pool)
 
 	scrapers := map[string]scraper.Scraper{
-		"kalibrr": scraper.NewKalibrrScraper(""),
+		"kalibrr": scraper.NewKalibrrScraper(),
 	}
 	pl := pipeline.New(st, scrapers, pipeline.Config{})
 

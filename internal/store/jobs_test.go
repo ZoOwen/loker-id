@@ -33,6 +33,46 @@ func TestUpsertJob_InsertsNew(t *testing.T) {
 	if result.Job.CanonicalJobID.Valid {
 		t.Errorf("CanonicalJobID = %v, want NULL for a fresh unmatched job", result.Job.CanonicalJobID)
 	}
+	if !result.WasInserted {
+		t.Errorf("WasInserted = false, want true for a job that didn't exist before")
+	}
+}
+
+// TestUpsertJob_RescrapeReportsWasInsertedFalse checks the signal the
+// pipeline relies on to avoid double-counting a job as "new": a second
+// UpsertJob call for the same (source_id, source_url) — exactly what
+// happens when the same posting surfaces under more than one search
+// keyword — refreshes the existing row rather than creating another one,
+// so WasInserted must be false the second time even though the row isn't
+// a fuzzy duplicate of anything else (IsDuplicate stays false too).
+func TestUpsertJob_RescrapeReportsWasInsertedFalse(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sourceID := mustSourceID(t, s, "kalibrr")
+	companyID := testCompany(t, s, "Acme")
+
+	params := testJobParams(companyID, sourceID, "https://kalibrr.com/jobs/rescrape-wasinserted")
+	first, err := s.UpsertJob(ctx, params)
+	if err != nil {
+		t.Fatalf("first UpsertJob() error = %v", err)
+	}
+	if !first.WasInserted {
+		t.Fatalf("first upsert: WasInserted = false, want true")
+	}
+
+	second, err := s.UpsertJob(ctx, params)
+	if err != nil {
+		t.Fatalf("second UpsertJob() error = %v", err)
+	}
+	if second.WasInserted {
+		t.Errorf("second upsert of the same (source_id, source_url): WasInserted = true, want false")
+	}
+	if second.IsDuplicate {
+		t.Errorf("second upsert of the same (source_id, source_url): IsDuplicate = true, want false (it's the same row, not a duplicate of a different one)")
+	}
+	if second.Job.ID != first.Job.ID {
+		t.Errorf("second upsert created a different row: %s, want same id %s", second.Job.ID, first.Job.ID)
+	}
 }
 
 func TestUpsertJob_ReScrapeRefreshesContentAndReactivates(t *testing.T) {

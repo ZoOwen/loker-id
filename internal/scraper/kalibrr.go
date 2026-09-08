@@ -3,6 +3,7 @@ package scraper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,6 +32,33 @@ import (
 // unexplained path segment that switches the router into keyword-search
 // mode. Reverse-engineered by probing the live site; not documented
 // anywhere public that we found.
+//
+// Coverage comes from the keyword list, not deep pagination, and that's a
+// deliberate call, not an oversight: as of 2026-09-09, Kalibrr's own
+// server-side pagination for this route is broken. Fetching pages 1, 2,
+// and 3 of the same keyword and diffing their embedded __NEXT_DATA__
+// shows the page path segment reaching the Next.js router fine
+// (query.param's third element is genuinely "1"/"2"/"3"), but
+// pageProps.filters.offset comes back as 0 on every single one — the
+// page number just isn't translated into a query offset server-side, so
+// every page replays the same first `limit` (15) results. Query-string
+// variants (?page=2, ?offset=15) don't change that either. Our own
+// maxPages/early-stop logic (see Scrape) is correct and does exactly what
+// it should here — it detects page 2 duplicating page 1 and stops after
+// one page, per keyword. There's simply nothing further to page into
+// right now. If Kalibrr ever fixes their pagination, this scraper starts
+// walking multiple pages per keyword automatically — nothing here assumes
+// it's broken forever, it just isn't relied upon.
+//
+// So instead of depth (pages), this scraper gets breadth (keywords):
+// DefaultKalibrrKeywords runs one search per keyword and aggregates the
+// results. The same real-world posting routinely turns up under more than
+// one keyword (e.g. a "Backend Engineer (Golang)" role matches both
+// "backend" and "golang") — that's expected, and internal/store's
+// existing fingerprint/source_url dedup is what collapses it back down to
+// one job, not anything special here. See store.UpsertJobResult.WasInserted
+// and Pipeline.Run's JobsNew/JobsDuplicate accounting for how that shows
+// up in a run's numbers.
 const (
 	kalibrrSource = "kalibrr"
 	kalibrrHost   = "www.kalibrr.com"
@@ -40,8 +68,6 @@ const (
 	// opposed to pretending to be a browser.
 	kalibrrUserAgent = "loker-id-bot/1.0 (+https://github.com/ZoOwen/loker-id)"
 
-	defaultKalibrrKeyword = "software-engineer"
-
 	kalibrrRequestTimeout = 15 * time.Second
 	kalibrrRequestDelay   = 2 * time.Second
 	kalibrrRandomDelay    = 1 * time.Second
@@ -50,12 +76,25 @@ const (
 	kalibrrRetryBaseDelay = 1 * time.Second
 )
 
-// KalibrrScraper implements Scraper for kalibrr.com job listings matching
-// a search keyword.
+// DefaultKalibrrKeywords is the keyword set NewKalibrrScraper searches by
+// default when called with none of its own — chosen to cover the
+// practical breadth of Indonesian dev-job listings on Kalibrr, since deep
+// pagination isn't an option right now (see the package doc comment
+// above).
+var DefaultKalibrrKeywords = []string{
+	"backend", "frontend", "fullstack", "devops", "mobile",
+	"data engineer", "qa", "golang", "react", "python",
+	"java", "php", "nodejs", "android", "ios",
+}
+
+// KalibrrScraper implements Scraper for kalibrr.com job listings, running
+// one search per keyword and aggregating the results (see the package doc
+// comment for why keywords, not pages, are how this scraper gets
+// coverage).
 type KalibrrScraper struct {
 	collector      *colly.Collector
 	baseURL        string
-	keyword        string
+	keywords       []string
 	maxRetries     int
 	retryBaseDelay time.Duration
 	logger         *slog.Logger
@@ -70,7 +109,7 @@ type KalibrrScraper struct {
 // widening the public API.
 type kalibrrConfig struct {
 	baseURL        string
-	keyword        string
+	keywords       []string
 	requestTimeout time.Duration
 	requestDelay   time.Duration
 	randomDelay    time.Duration
@@ -82,7 +121,7 @@ type kalibrrConfig struct {
 func defaultKalibrrConfig() kalibrrConfig {
 	return kalibrrConfig{
 		baseURL:        kalibrrBase,
-		keyword:        defaultKalibrrKeyword,
+		keywords:       DefaultKalibrrKeywords,
 		requestTimeout: kalibrrRequestTimeout,
 		requestDelay:   kalibrrRequestDelay,
 		randomDelay:    kalibrrRandomDelay,
@@ -103,13 +142,14 @@ type kalibrrPageResult struct {
 	retryable bool
 }
 
-// NewKalibrrScraper builds a Scraper for kalibrr.com, searching listings
-// that match keyword (e.g. "software-engineer", "backend", "devops"). An
-// empty keyword falls back to "software-engineer".
-func NewKalibrrScraper(keyword string) *KalibrrScraper {
+// NewKalibrrScraper builds a Scraper for kalibrr.com, running one search
+// per keyword given (e.g. "backend", "golang", "devops") and aggregating
+// the results. Called with no keywords, it searches DefaultKalibrrKeywords
+// instead.
+func NewKalibrrScraper(keywords ...string) *KalibrrScraper {
 	cfg := defaultKalibrrConfig()
-	if keyword != "" {
-		cfg.keyword = keyword
+	if len(keywords) > 0 {
+		cfg.keywords = keywords
 	}
 	return newKalibrrScraper(cfg)
 }
@@ -122,7 +162,7 @@ func newKalibrrScraper(cfg kalibrrConfig) *KalibrrScraper {
 
 	s := &KalibrrScraper{
 		baseURL:        cfg.baseURL,
-		keyword:        cfg.keyword,
+		keywords:       cfg.keywords,
 		maxRetries:     cfg.maxRetries,
 		retryBaseDelay: cfg.retryBaseDelay,
 		logger:         logger,
@@ -162,34 +202,71 @@ func newKalibrrScraper(cfg kalibrrConfig) *KalibrrScraper {
 
 func (s *KalibrrScraper) Source() string { return kalibrrSource }
 
+// Scrape runs one paginated search per configured keyword (see
+// DefaultKalibrrKeywords and the package doc comment) and aggregates
+// every keyword's jobs into one slice. A keyword that comes back with an
+// error doesn't stop the others — it's collected and joined into the
+// returned error alongside whatever jobs were gathered, the same
+// "partial results, not a silent loss" contract Scrape has always had for
+// a single search. The same real-world job commonly turns up under more
+// than one keyword; that's expected and left for internal/store's
+// existing dedup to collapse — see the package doc comment.
 func (s *KalibrrScraper) Scrape(ctx context.Context, maxPages int) ([]RawJob, error) {
 	maxPages = ClampMaxPages(maxPages)
 
+	var jobs []RawJob
+	var errs []error
+
+	for _, keyword := range s.keywords {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+
+		keywordJobs, err := s.scrapeKeyword(ctx, keyword, maxPages)
+		jobs = append(jobs, keywordJobs...)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("keyword %q: %w", keyword, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return jobs, fmt.Errorf("scraper: kalibrr: %w", errors.Join(errs...))
+	}
+	return jobs, nil
+}
+
+// scrapeKeyword walks up to maxPages of results for a single keyword,
+// stopping early on an empty page or one whose jobs all duplicate the
+// previous page — see Scrape's doc comment on why that's expected to
+// trigger after just one page for the time being.
+func (s *KalibrrScraper) scrapeKeyword(ctx context.Context, keyword string, maxPages int) ([]RawJob, error) {
 	var jobs []RawJob
 	total := -1
 	var prevPageIDs map[string]bool
 
 	for page := 1; page <= maxPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return jobs, fmt.Errorf("scraper: kalibrr: %w", err)
+			return jobs, err
 		}
 
 		start := time.Now()
-		pageJobs, count, err := s.fetchPage(ctx, page)
+		pageJobs, count, err := s.fetchPage(ctx, keyword, page)
 		duration := time.Since(start)
 		if err != nil {
-			return jobs, fmt.Errorf("scraper: kalibrr: page %d: %w", page, err)
+			return jobs, fmt.Errorf("page %d: %w", page, err)
 		}
 
 		s.logger.Info("scraped page",
 			"source", kalibrrSource,
+			"keyword", keyword,
 			"page", page,
 			"jobs_found", len(pageJobs),
 			"duration", duration,
 		)
 
 		if len(pageJobs) == 0 {
-			s.logger.Info("stopping early: empty page", "source", kalibrrSource, "page", page)
+			s.logger.Info("stopping early: empty page", "source", kalibrrSource, "keyword", keyword, "page", page)
 			break
 		}
 
@@ -200,7 +277,7 @@ func (s *KalibrrScraper) Scrape(ctx context.Context, maxPages int) ([]RawJob, er
 		// maxPages for no reason.
 		pageIDs := kalibrrJobIDSet(pageJobs)
 		if prevPageIDs != nil && kalibrrIsSubsetOf(pageIDs, prevPageIDs) {
-			s.logger.Info("stopping early: page duplicates the previous one", "source", kalibrrSource, "page", page)
+			s.logger.Info("stopping early: page duplicates the previous one", "source", kalibrrSource, "keyword", keyword, "page", page)
 			break
 		}
 		prevPageIDs = pageIDs
@@ -242,8 +319,8 @@ func kalibrrIsSubsetOf(a, b map[string]bool) bool {
 // content turned out to need JS after all) is treated as a hard,
 // non-retryable error rather than an empty page, so callers never mistake
 // "something broke" for "no more results".
-func (s *KalibrrScraper) fetchPage(ctx context.Context, page int) ([]RawJob, int, error) {
-	u := fmt.Sprintf("%s/job-board/te/%s/%d", s.baseURL, url.PathEscape(s.keyword), page)
+func (s *KalibrrScraper) fetchPage(ctx context.Context, keyword string, page int) ([]RawJob, int, error) {
+	u := fmt.Sprintf("%s/job-board/te/%s/%d", s.baseURL, url.PathEscape(keyword), page)
 
 	var res kalibrrPageResult
 	err := withBackoff(ctx, s.maxRetries, s.retryBaseDelay, func() (bool, error) {

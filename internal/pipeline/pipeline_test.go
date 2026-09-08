@@ -197,6 +197,45 @@ func TestRun_DetectsDuplicates(t *testing.T) {
 	}
 }
 
+// TestRun_SameRawJobTwiceCountsAsOneNewAndOneDuplicate guards the scenario
+// multi-keyword scraping introduces: a scraper (e.g. Kalibrr, searched
+// once per keyword) can return the exact same posting — same
+// SourceURL/SourceJobID — more than once in a single Scrape() call,
+// because the posting matched more than one keyword. That must land as
+// one row in the DB, counted once as new and once as a duplicate — not
+// two rows, and not "new" twice.
+func TestRun_SameRawJobTwiceCountsAsOneNewAndOneDuplicate(t *testing.T) {
+	sc := &fakeScraper{slug: "kalibrr", jobs: []scraper.RawJob{
+		rawJob("https://kalibrr.com/jobs/cross-keyword", "Backend Engineer", "Acme"),
+		rawJob("https://kalibrr.com/jobs/cross-keyword", "Backend Engineer", "Acme"),
+	}}
+	p, _, pool := newTestPipeline(t, sc)
+	ctx := context.Background()
+
+	result, err := p.Run(ctx, "kalibrr", 3)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.JobsFound != 2 {
+		t.Errorf("JobsFound = %d, want 2 (the scraper did return it twice)", result.JobsFound)
+	}
+	if result.JobsNew != 1 {
+		t.Errorf("JobsNew = %d, want 1", result.JobsNew)
+	}
+	if result.JobsDuplicate != 1 {
+		t.Errorf("JobsDuplicate = %d, want 1 (the second occurrence is a re-scrape of the same row, not a fresh one)", result.JobsDuplicate)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jobs WHERE source_url = $1", "https://kalibrr.com/jobs/cross-keyword").Scan(&count); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("jobs with this source_url = %d, want 1 (must not create a second row)", count)
+	}
+}
+
 func TestRun_UnknownSourceReturnsErrorWithoutCreatingARun(t *testing.T) {
 	sc := &fakeScraper{slug: "kalibrr"}
 	p, _, pool := newTestPipeline(t, sc)

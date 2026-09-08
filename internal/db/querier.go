@@ -84,8 +84,14 @@ type Querier interface {
 	// just id): the store layer needs posted_at/first_seen_at/fingerprint/
 	// company_id/title_normalized right after upserting to run dedup
 	// resolution, and a second SELECT to fetch them would be redundant
-	// inside the same transaction.
-	UpsertJob(ctx context.Context, arg UpsertJobParams) (Job, error)
+	// inside the same transaction. `xmax = 0` is the standard Postgres tell
+	// for "this row was just INSERTed, not UPDATEd via the ON CONFLICT
+	// branch" within the same command — the store layer needs that to tell a
+	// genuinely new job apart from an already-known one being refreshed
+	// (which now happens routinely: the same Kalibrr posting surfaces under
+	// several of our keyword searches, and hits this same conflict target on
+	// its second-and-later occurrence within a single run).
+	UpsertJob(ctx context.Context, arg UpsertJobParams) (UpsertJobRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

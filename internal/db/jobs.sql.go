@@ -430,7 +430,7 @@ ON CONFLICT (source_id, source_url) DO UPDATE SET
     posted_at         = EXCLUDED.posted_at,
     last_seen_at      = NOW(),
     is_active         = TRUE
-RETURNING id, title, title_normalized, company_id, description, salary_min, salary_max, salary_currency, salary_conf, salary_raw, stack, location, location_city, mode, level, source_id, source_url, source_job_id, fingerprint, canonical_job_id, search_vector, posted_at, first_seen_at, last_seen_at, is_active
+RETURNING id, title, title_normalized, company_id, description, salary_min, salary_max, salary_currency, salary_conf, salary_raw, stack, location, location_city, mode, level, source_id, source_url, source_job_id, fingerprint, canonical_job_id, search_vector, posted_at, first_seen_at, last_seen_at, is_active, (xmax = 0) AS inserted
 `
 
 type UpsertJobParams struct {
@@ -454,6 +454,35 @@ type UpsertJobParams struct {
 	PostedAt        pgtype.Timestamptz `json:"posted_at"`
 }
 
+type UpsertJobRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Title           string             `json:"title"`
+	TitleNormalized string             `json:"title_normalized"`
+	CompanyID       uuid.UUID          `json:"company_id"`
+	Description     pgtype.Text        `json:"description"`
+	SalaryMin       pgtype.Int8        `json:"salary_min"`
+	SalaryMax       pgtype.Int8        `json:"salary_max"`
+	SalaryCurrency  string             `json:"salary_currency"`
+	SalaryConf      SalaryConfidence   `json:"salary_conf"`
+	SalaryRaw       pgtype.Text        `json:"salary_raw"`
+	Stack           []string           `json:"stack"`
+	Location        pgtype.Text        `json:"location"`
+	LocationCity    pgtype.Text        `json:"location_city"`
+	Mode            WorkMode           `json:"mode"`
+	Level           ExperienceLevel    `json:"level"`
+	SourceID        int32              `json:"source_id"`
+	SourceUrl       string             `json:"source_url"`
+	SourceJobID     pgtype.Text        `json:"source_job_id"`
+	Fingerprint     string             `json:"fingerprint"`
+	CanonicalJobID  pgtype.UUID        `json:"canonical_job_id"`
+	SearchVector    string             `json:"search_vector"`
+	PostedAt        pgtype.Timestamptz `json:"posted_at"`
+	FirstSeenAt     pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt      pgtype.Timestamptz `json:"last_seen_at"`
+	IsActive        bool               `json:"is_active"`
+	Inserted        bool               `json:"inserted"`
+}
+
 // Inserts a job, or — keyed on (source_id, source_url), which is what a
 // re-scrape of the same listing shares — refreshes its content and marks
 // it seen again. canonical_job_id is deliberately absent from both the
@@ -466,8 +495,14 @@ type UpsertJobParams struct {
 // just id): the store layer needs posted_at/first_seen_at/fingerprint/
 // company_id/title_normalized right after upserting to run dedup
 // resolution, and a second SELECT to fetch them would be redundant
-// inside the same transaction.
-func (q *Queries) UpsertJob(ctx context.Context, arg UpsertJobParams) (Job, error) {
+// inside the same transaction. `xmax = 0` is the standard Postgres tell
+// for "this row was just INSERTed, not UPDATEd via the ON CONFLICT
+// branch" within the same command — the store layer needs that to tell a
+// genuinely new job apart from an already-known one being refreshed
+// (which now happens routinely: the same Kalibrr posting surfaces under
+// several of our keyword searches, and hits this same conflict target on
+// its second-and-later occurrence within a single run).
+func (q *Queries) UpsertJob(ctx context.Context, arg UpsertJobParams) (UpsertJobRow, error) {
 	row := q.db.QueryRow(ctx, upsertJob,
 		arg.Title,
 		arg.TitleNormalized,
@@ -488,7 +523,7 @@ func (q *Queries) UpsertJob(ctx context.Context, arg UpsertJobParams) (Job, erro
 		arg.Fingerprint,
 		arg.PostedAt,
 	)
-	var i Job
+	var i UpsertJobRow
 	err := row.Scan(
 		&i.ID,
 		&i.Title,
@@ -515,6 +550,7 @@ func (q *Queries) UpsertJob(ctx context.Context, arg UpsertJobParams) (Job, erro
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
 		&i.IsActive,
+		&i.Inserted,
 	)
 	return i, err
 }

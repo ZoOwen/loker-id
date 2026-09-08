@@ -136,7 +136,13 @@ func (p *Pipeline) Run(ctx context.Context, sourceSlug string, maxPages int) (*R
 			continue
 		}
 
-		if upserted.IsDuplicate {
+		// A job counts as new only the first time it's ever inserted; a
+		// re-scrape of an already-known listing (same source_id+
+		// source_url — including a second, third, ... occurrence of the
+		// same posting surfacing under a different search keyword within
+		// this very run) or a fresh row that immediately resolves as a
+		// fuzzy duplicate of an older one both mean nothing new landed.
+		if !upserted.WasInserted || upserted.IsDuplicate {
 			result.JobsDuplicate++
 		} else {
 			result.JobsNew++
