@@ -44,6 +44,22 @@ func TestExtractStack(t *testing.T) {
 			[]string{"AWS", "Docker", "Kubernetes", "Terraform"},
 		},
 		{
+			"expanded devops tooling — previously missing from the curated list entirely",
+			"DevOps Engineer", "CI/CD pipelines with Jenkins and GitLab, monitoring via Prometheus and Grafana, Ansible for config management, Nginx as reverse proxy, Helm charts, Elasticsearch for logs",
+			[]string{"Ansible", "Elasticsearch", "GitLab", "Grafana", "Helm", "Jenkins", "Nginx", "Prometheus"},
+		},
+		{
+			"github actions as a two-word alias",
+			"DevOps Engineer", "CI/CD with GitHub Actions",
+			[]string{"GitHub Actions"},
+		},
+		{
+			"real-world case: HTML with an inline tag splitting a tech name mid-word must still match once cleaned — this is what bug 1's SanitizeDescription fixes for ExtractStack",
+			"DevOps Engineer",
+			SanitizeDescription("<ul><li>Experience with <b>Doc</b><b>ker</b> and Kubernetes</li><li>Familiar with <strong>Jenkins</strong> and Ansible</li></ul>"),
+			[]string{"Ansible", "Docker", "Jenkins", "Kubernetes"},
+		},
+		{
 			"mobile stack",
 			"Mobile Developer", "Flutter dan React Native",
 			[]string{"Flutter", "React Native"},

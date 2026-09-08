@@ -110,9 +110,18 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// newSchemaName must be unique not just within this process but across
+// concurrently-running ones: `go test ./...` runs each package's tests as
+// a separate OS process, potentially in parallel, and each gets its own
+// independent schemaCounter starting back at 1. Two such processes can
+// legitimately observe the same time.Now().UnixNano() value too — clock
+// resolution is often coarser than one nanosecond (routinely true on
+// Windows) — so timestamp+counter alone collided in practice. The OS
+// process id is guaranteed unique among processes running at the same
+// time on one machine, which closes that gap.
 func newSchemaName() string {
 	n := schemaCounter.Add(1)
-	return fmt.Sprintf("test_%d_%d", time.Now().UnixNano(), n)
+	return fmt.Sprintf("test_%d_%d_%d", os.Getpid(), time.Now().UnixNano(), n)
 }
 
 // migrationPath locates migrations/001_init.sql relative to this source

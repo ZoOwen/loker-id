@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -116,6 +117,44 @@ func TestRun_HappyPath(t *testing.T) {
 	}
 	if !src.LastRunAt.Valid {
 		t.Error("sources.last_run_at is still NULL after a run")
+	}
+}
+
+// TestRun_StoresSanitizedDescriptionNotRawHTML guards against exactly the
+// wiring bug this fixed: processJob used to pass raw.Description (straight
+// HTML from the scraper) to the store instead of normalized.Description
+// (SanitizeDescription's cleaned output). Checked through the real
+// database, not just at the normalizer unit level, since that's the layer
+// where the bug actually was.
+func TestRun_StoresSanitizedDescriptionNotRawHTML(t *testing.T) {
+	sc := &fakeScraper{slug: "kalibrr", jobs: []scraper.RawJob{
+		{
+			Title:       "Backend Engineer",
+			Company:     "Acme",
+			Description: `<ul><li>Familiar with <strong>Docker</strong></li><li class="foo">Second point</li></ul>`,
+			SourceURL:   "https://kalibrr.com/jobs/html-description",
+			SourceJobID: "1",
+		},
+	}}
+	p, _, pool := newTestPipeline(t, sc)
+	ctx := context.Background()
+
+	if _, err := p.Run(ctx, "kalibrr"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	var description string
+	err := pool.QueryRow(ctx, "SELECT description FROM jobs WHERE source_url = $1", "https://kalibrr.com/jobs/html-description").Scan(&description)
+	if err != nil {
+		t.Fatalf("read back job: %v", err)
+	}
+
+	if strings.Contains(description, "<") {
+		t.Errorf("stored description still contains raw HTML: %q", description)
+	}
+	want := "- Familiar with Docker\n- Second point"
+	if description != want {
+		t.Errorf("stored description = %q, want %q", description, want)
 	}
 }
 

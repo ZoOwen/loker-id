@@ -40,6 +40,7 @@ const (
 type NormalizedJob struct {
 	Title, TitleNormalized         string
 	CompanyName, CompanyNormalized string
+	Description                    string
 	Salary                         parser.Salary
 	Stack                          []string
 	Mode                           WorkMode
@@ -52,16 +53,25 @@ type NormalizedJob struct {
 func Normalize(raw scraper.RawJob) NormalizedJob {
 	titleNorm := NormalizeTitle(raw.Title)
 	companyNorm := NormalizeCompany(raw.Company)
+	// Description is HTML straight from the source (Kalibrr's rich-text
+	// job posts are full of <p>/<li>/class="..." markup). Clean it once,
+	// up front, and derive everything downstream from the clean version:
+	// storing raw HTML bloats the API response, and — separately —
+	// leaving it in place for ExtractStack risks an inline tag splitting
+	// a tech name mid-word (e.g. "Doc<b>ker</b>") so it never matches at
+	// all. Both problems share the one fix.
+	description := SanitizeDescription(raw.Description)
 
 	return NormalizedJob{
 		Title:             strings.TrimSpace(raw.Title),
 		TitleNormalized:   titleNorm,
 		CompanyName:       strings.TrimSpace(raw.Company),
 		CompanyNormalized: companyNorm,
+		Description:       description,
 		Salary:            parser.ParseSalary(raw.SalaryRaw),
-		Stack:             ExtractStack(raw.Title, raw.Description),
-		Mode:              DetectMode(raw.Title, raw.Location, raw.Description),
-		Level:             DetectLevel(raw.Title),
+		Stack:             ExtractStack(raw.Title, description),
+		Mode:              DetectMode(raw.Title, raw.Location, description),
+		Level:             DetectLevel(raw.Title, description),
 		LocationCity:      extractCity(raw.Location),
 		Fingerprint:       Fingerprint(companyNorm, titleNorm),
 	}

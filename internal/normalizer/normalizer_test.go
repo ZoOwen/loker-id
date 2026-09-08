@@ -2,6 +2,7 @@ package normalizer
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ZoOwen/loker-id/internal/parser"
@@ -26,6 +27,9 @@ func TestNormalize(t *testing.T) {
 	}
 	if got.CompanyName != raw.Company {
 		t.Errorf("CompanyName = %q, want raw company %q unchanged", got.CompanyName, raw.Company)
+	}
+	if got.Description != raw.Description {
+		t.Errorf("Description = %q, want %q (already plain text, so sanitizing is a no-op here)", got.Description, raw.Description)
 	}
 
 	wantTitleNorm := NormalizeTitle(raw.Title)
@@ -85,5 +89,44 @@ func TestNormalize_NoSignals(t *testing.T) {
 	}
 	if got.LocationCity != "" {
 		t.Errorf("LocationCity = %q, want empty", got.LocationCity)
+	}
+}
+
+// TestNormalize_SanitizesHTMLDescription is the end-to-end version of the
+// bug 1 -> bug 4 chain: Normalize must store cleaned text (not raw HTML)
+// in Description, and ExtractStack/DetectMode/DetectLevel must all see
+// that same cleaned text rather than raw markup.
+func TestNormalize_SanitizesHTMLDescription(t *testing.T) {
+	raw := scraper.RawJob{
+		Title:    "DevOps Engineer",
+		Company:  "Acme",
+		Location: "Jakarta, Indonesia",
+		Description: "<ul>" +
+			"<li>Manage <b>Doc</b><b>ker</b> containers and Kubernetes clusters</li>" +
+			"<li>3 years of experience with Jenkins and Ansible</li>" +
+			"<li class=\"text-justify\">Remote-friendly team, fully remote position</li>" +
+			"</ul>",
+	}
+
+	got := Normalize(raw)
+
+	if strings.Contains(got.Description, "<") || strings.Contains(got.Description, "class=") {
+		t.Errorf("Description still contains raw HTML: %q", got.Description)
+	}
+	if !strings.HasPrefix(got.Description, "- Manage Docker containers") {
+		t.Errorf("Description = %q, want it to start with the cleaned first bullet (with Doc+ker rejoined into Docker)", got.Description)
+	}
+
+	wantStack := []string{"Ansible", "Docker", "Jenkins", "Kubernetes"}
+	if !reflect.DeepEqual(got.Stack, wantStack) {
+		t.Errorf("Stack = %v, want %v (extracted from the cleaned description, including the tag-split \"Docker\")", got.Stack, wantStack)
+	}
+
+	if got.Mode != ModeRemote {
+		t.Errorf("Mode = %q, want %q (detected from \"fully remote\" in the cleaned description)", got.Mode, ModeRemote)
+	}
+
+	if got.Level != LevelMid {
+		t.Errorf("Level = %q, want %q (fallback from \"3 years of experience\" in the cleaned description, no title keyword present)", got.Level, LevelMid)
 	}
 }

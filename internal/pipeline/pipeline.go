@@ -211,7 +211,7 @@ func (p *Pipeline) processJob(ctx context.Context, sourceID int32, raw scraper.R
 		Title:           normalized.Title,
 		TitleNormalized: normalized.TitleNormalized,
 		CompanyID:       companyID,
-		Description:     raw.Description,
+		Description:     normalized.Description,
 		Salary:          normalized.Salary,
 		Stack:           normalized.Stack,
 		Location:        raw.Location,
