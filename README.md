@@ -74,6 +74,24 @@ If Kalibrr fixes their pagination, this scraper starts walking multiple
 pages per keyword automatically; nothing here assumes it's permanently
 broken, it's just not relied on.
 
+**Country lock.** Every request is prefixed with `/id-ID` (Next.js's own
+locale-routing path prefix). This exists because of a real incident: once
+deployed to Render's Singapore region, every scraped job came back
+Filipino (Makati, Pasig, Quezon City...) with zero Indonesian listings,
+while the same code run from an Indonesia-resident IP was fine. Kalibrr's
+unprefixed routes pick a country by geo-IP (confirmed via the page's own
+`__NEXT_DATA__`, which carries both a `geoCountry` field and Next.js's
+`locale`/`locales` metadata — exactly two configured locales, `en` and
+`id-ID`); Render's Singapore egress IP apparently geolocates as the
+Philippines on Kalibrr's (or Cloudflare's, which fronts kalibrr.com) side.
+The `/id-ID` prefix pins the locale server-side regardless of the
+requester's IP — verified by fetching it directly and checking both
+`__NEXT_DATA__.locale` and every job's country. See the doc comment on
+`kalibrrLocalePrefix` in `internal/scraper/kalibrr.go` for the full
+investigation. `checkKalibrrCountry` also logs a warning if a scrape ever
+comes back with a job outside Indonesia anyway, so a regression here
+surfaces immediately instead of silently polluting the database again.
+
 One consequence: the same real posting routinely surfaces under more than
 one keyword (e.g. a Go backend role matches both "backend" and "golang").
 That's expected, and it's `internal/store`'s existing dedup — keyed on

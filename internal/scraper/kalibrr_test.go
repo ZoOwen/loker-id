@@ -1,6 +1,7 @@
 package scraper
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -65,6 +66,28 @@ func sampleJobJSON(id int) string {
 	}`, id)
 }
 
+// sampleJobJSONInCountry is sampleJobJSON with a caller-chosen city and
+// country, for tests exercising checkKalibrrCountry — the default
+// sampleJobJSON is always Indonesia, which isn't enough on its own to
+// test the "flag anything else" path.
+func sampleJobJSONInCountry(id int, city, country string) string {
+	return fmt.Sprintf(`{
+		"id": %d,
+		"name": "Backend Engineer",
+		"companyName": "PT Contoh",
+		"company": {"code": "contoh"},
+		"slug": "backend-engineer",
+		"description": "<p>desc</p>",
+		"qualifications": "<p>quals</p>",
+		"salaryShown": false,
+		"isHybrid": false,
+		"isWorkFromHome": false,
+		"createdAt": "2026-01-01T00:00:00.000000+00:00",
+		"activationDate": "2026-01-02T03:04:05.123456+00:00",
+		"googleLocation": {"addressComponents": {"city": %q, "country": %q}}
+	}`, id, city, country)
+}
+
 // pageNumberFromPath parses the trailing /job-board/te/<keyword>/<page>
 // path segment as an int, for handlers that need to vary their response
 // by requested page.
@@ -99,6 +122,14 @@ func neverEndingServer() *httptest.Server {
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// capturingLogger is testLogger, but keeps the output around instead of
+// discarding it — for tests that need to assert on a specific log line
+// (e.g. checkKalibrrCountry's warning) rather than just "did it crash".
+func capturingLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
 }
 
 func TestKalibrrScraper_Source(t *testing.T) {
@@ -568,5 +599,116 @@ func TestKalibrrScraper_ContinuesToNextKeywordAfterOneFails(t *testing.T) {
 
 	if len(jobs) != 2 {
 		t.Errorf("len(jobs) = %d, want 2 (backend and golang still succeeded)", len(jobs))
+	}
+}
+
+// TestKalibrrScraper_RequestsUseTheIndonesiaLocalePrefix guards the fix
+// for the 2026-09-09 production incident (see the package doc comment in
+// kalibrr.go): every request must carry the /id-ID locale prefix, which
+// is what pins the results to Indonesia regardless of the scraping
+// server's own geo-IP.
+func TestKalibrrScraper_RequestsUseTheIndonesiaLocalePrefix(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(1))))
+	}))
+	defer server.Close()
+
+	s := newKalibrrScraper(testConfig(server))
+	if _, err := s.Scrape(context.Background(), 1); err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+
+	if !strings.HasPrefix(gotPath, kalibrrLocalePrefix+"/") {
+		t.Errorf("requested path = %q, want it to start with %q", gotPath, kalibrrLocalePrefix+"/")
+	}
+}
+
+// TestKalibrrScraper_WarnsWhenAJobIsOutsideIndonesia checks
+// checkKalibrrCountry's guard: a job with a known, non-Indonesia country
+// must produce a warning log naming that country, so a regression of the
+// 2026-09-09 incident (locale lock stops working, geoIP takes over again)
+// is visible immediately instead of silently landing in the database.
+func TestKalibrrScraper_WarnsWhenAJobIsOutsideIndonesia(t *testing.T) {
+	jobsJSON := sampleJobJSONInCountry(1, "Central Jakarta", "Indonesia") + "," +
+		sampleJobJSONInCountry(2, "Makati", "Philippines")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(nextDataPage(2, jobsJSON)))
+	}))
+	defer server.Close()
+
+	logger, logs := capturingLogger()
+	cfg := testConfig(server)
+	cfg.logger = logger
+	s := newKalibrrScraper(cfg)
+
+	if _, err := s.Scrape(context.Background(), 1); err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+
+	got := logs.String()
+	if !strings.Contains(got, "outside the expected country") {
+		t.Errorf("logs = %q, want a warning about a job outside the expected country", got)
+	}
+	if !strings.Contains(got, "Philippines") {
+		t.Errorf("logs = %q, want the offending country named", got)
+	}
+}
+
+// TestKalibrrScraper_NoWarningWhenEveryJobIsIndonesia checks the other
+// side of checkKalibrrCountry: an all-Indonesia page (the expected,
+// working case) must not produce a warning — otherwise the signal is
+// noise and gets ignored exactly when a real incident needs it noticed.
+func TestKalibrrScraper_NoWarningWhenEveryJobIsIndonesia(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(nextDataPage(1, sampleJobJSON(1))))
+	}))
+	defer server.Close()
+
+	logger, logs := capturingLogger()
+	cfg := testConfig(server)
+	cfg.logger = logger
+	s := newKalibrrScraper(cfg)
+
+	if _, err := s.Scrape(context.Background(), 1); err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+
+	if got := logs.String(); strings.Contains(got, "outside the expected country") {
+		t.Errorf("logs = %q, want no country warning for an all-Indonesia page", got)
+	}
+}
+
+// TestKalibrrScraper_NoWarningWhenLocationIsUnknown checks that a job
+// with no googleLocation at all (Kalibrr doesn't always have geocoded
+// location data) is skipped by checkKalibrrCountry rather than flagged —
+// "unknown" isn't evidence the locale lock failed.
+func TestKalibrrScraper_NoWarningWhenLocationIsUnknown(t *testing.T) {
+	jobJSON := `{
+		"id": 1, "name": "Backend Engineer", "companyName": "PT Contoh",
+		"company": {"code": "contoh"}, "slug": "backend-engineer",
+		"description": "", "qualifications": "", "salaryShown": false,
+		"isHybrid": false, "isWorkFromHome": false,
+		"createdAt": "2026-01-01T00:00:00.000000+00:00",
+		"activationDate": "2026-01-02T03:04:05.123456+00:00",
+		"googleLocation": null
+	}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(nextDataPage(1, jobJSON)))
+	}))
+	defer server.Close()
+
+	logger, logs := capturingLogger()
+	cfg := testConfig(server)
+	cfg.logger = logger
+	s := newKalibrrScraper(cfg)
+
+	if _, err := s.Scrape(context.Background(), 1); err != nil {
+		t.Fatalf("Scrape() error = %v", err)
+	}
+
+	if got := logs.String(); strings.Contains(got, "outside the expected country") {
+		t.Errorf("logs = %q, want no country warning when location is unknown", got)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,10 +60,54 @@ import (
 // one job, not anything special here. See store.UpsertJobResult.WasInserted
 // and Pipeline.Run's JobsNew/JobsDuplicate accounting for how that shows
 // up in a run's numbers.
+//
+// The country these searches return is geo-IP-based, not fixed by
+// keyword or "te" search mode — a real production incident on 2026-09-09
+// (server deployed to Render's Singapore region) surfaced this: every
+// scraped job came back Filipino (Makati, Pasig, Quezon City...), zero
+// Indonesian, while the exact same code run from an Indonesia-resident IP
+// returned normal Indonesian listings. Confirmed directly against the
+// live site: every page's __NEXT_DATA__ carries
+// `props.pageProps.geoCountry` (e.g. {"country":"ID","actualCountry":
+// "ID"} when fetched from an Indonesia-geolocated IP) alongside Next.js's
+// own i18n metadata — `locale`/`locales`/`defaultLocale` — with exactly
+// two configured locales: "en" (default) and "id-ID". Kalibrr operates
+// separate country sites (kalibrr.com, kalibrr.id, kalibrr.ph — visible
+// in the page's own CSP header) and defaults the unprefixed route to
+// whichever country your request's IP geolocates to; Render's Singapore
+// egress IP apparently geolocates as the Philippines on Kalibrr's side
+// (or Cloudflare's, which fronts kalibrr.com — same effect either way).
+//
+// The fix is kalibrrLocalePrefix: prefixing every request with /id-ID
+// (Next.js's built-in locale-routing path prefix, not a Kalibrr-specific
+// param) pins `locale = "id-ID"` server-side regardless of the requesting
+// IP's geolocation — verified by fetching
+// https://www.kalibrr.com/id-ID/job-board/te/backend/1 directly: it
+// 308-redirects to /id-ID/home/te/backend/1 (same redirect the
+// unprefixed route already gets — see above), returns
+// `"locale":"id-ID"` in __NEXT_DATA__, and every job's
+// googleLocation.addressComponents.country is "Indonesia". Because this
+// is standard Next.js URL-based locale resolution rather than anything
+// IP-dependent, it's expected to hold from any hosting region — but
+// checkKalibrrCountry (called from handleNextData) logs a warning if a
+// scrape ever comes back non-Indonesian anyway, so a regression here
+// (Kalibrr restructuring their locale routing, geoIP starting to
+// override the prefix, ...) surfaces immediately instead of silently
+// polluting the database again.
 const (
 	kalibrrSource = "kalibrr"
 	kalibrrHost   = "www.kalibrr.com"
 	kalibrrBase   = "https://" + kalibrrHost
+
+	// kalibrrLocalePrefix pins every request to Kalibrr's Indonesia
+	// locale — see the package doc comment above for why this exists and
+	// how it was verified.
+	kalibrrLocalePrefix = "/id-ID"
+
+	// kalibrrExpectedCountry is what every job's
+	// googleLocation.addressComponents.country should read once
+	// kalibrrLocalePrefix is doing its job — see checkKalibrrCountry.
+	kalibrrExpectedCountry = "Indonesia"
 
 	// kalibrrUserAgent identifies this bot with a contact point, as
 	// opposed to pretending to be a browser.
@@ -320,7 +365,7 @@ func kalibrrIsSubsetOf(a, b map[string]bool) bool {
 // non-retryable error rather than an empty page, so callers never mistake
 // "something broke" for "no more results".
 func (s *KalibrrScraper) fetchPage(ctx context.Context, keyword string, page int) ([]RawJob, int, error) {
-	u := fmt.Sprintf("%s/job-board/te/%s/%d", s.baseURL, url.PathEscape(keyword), page)
+	u := fmt.Sprintf("%s%s/job-board/te/%s/%d", s.baseURL, kalibrrLocalePrefix, url.PathEscape(keyword), page)
 
 	var res kalibrrPageResult
 	err := withBackoff(ctx, s.maxRetries, s.retryBaseDelay, func() (bool, error) {
@@ -373,6 +418,8 @@ func (s *KalibrrScraper) handleNextData(e *colly.HTMLElement) {
 		jobs = append(jobs, j.toRawJob(s.baseURL))
 	}
 
+	s.checkKalibrrCountry(rawJobs, e.Request.URL.String())
+
 	s.mu.Lock()
 	s.result = kalibrrPageResult{
 		found: true,
@@ -380,6 +427,48 @@ func (s *KalibrrScraper) handleNextData(e *colly.HTMLElement) {
 		count: payload.Props.PageProps.Count,
 	}
 	s.mu.Unlock()
+}
+
+// checkKalibrrCountry logs a warning if any job on this page carries a
+// known country other than kalibrrExpectedCountry. kalibrrLocalePrefix
+// should make that impossible (see the package doc comment for the
+// 2026-09-09 incident this guards against) — but if Kalibrr's routing or
+// geoIP behavior ever changes underneath us, this is what surfaces it
+// immediately instead of silently filling the database with the wrong
+// country's jobs again. A job with no location data at all is skipped
+// rather than flagged — "unknown" isn't evidence of anything wrong.
+func (s *KalibrrScraper) checkKalibrrCountry(jobs []kalibrrJob, url string) {
+	var wrong int
+	seen := make(map[string]bool)
+	for _, j := range jobs {
+		if j.GoogleLocation == nil {
+			continue
+		}
+		country := j.GoogleLocation.AddressComponents.Country
+		if country == "" || country == kalibrrExpectedCountry {
+			continue
+		}
+		wrong++
+		seen[country] = true
+	}
+	if wrong == 0 {
+		return
+	}
+
+	countries := make([]string, 0, len(seen))
+	for c := range seen {
+		countries = append(countries, c)
+	}
+	sort.Strings(countries)
+
+	s.logger.Warn("scraped jobs outside the expected country — locale lock may not be working",
+		"source", kalibrrSource,
+		"url", url,
+		"expected_country", kalibrrExpectedCountry,
+		"total_jobs", len(jobs),
+		"wrong_country_jobs", wrong,
+		"countries_seen", countries,
+	)
 }
 
 func (s *KalibrrScraper) handleError(r *colly.Response, err error) {
