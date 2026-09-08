@@ -11,6 +11,39 @@ import (
 	"github.com/google/uuid"
 )
 
+const listCompaniesByIDs = `-- name: ListCompaniesByIDs :many
+SELECT id, name, name_normalized, logo_url, created_at FROM companies WHERE id = ANY($1::uuid[])
+`
+
+// Batch lookup for enriching a page of jobs with their company's display
+// name, e.g. in an HTTP handler — one query per page instead of one per
+// row.
+func (q *Queries) ListCompaniesByIDs(ctx context.Context, ids []uuid.UUID) ([]Company, error) {
+	rows, err := q.db.Query(ctx, listCompaniesByIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Company{}
+	for rows.Next() {
+		var i Company
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.NameNormalized,
+			&i.LogoUrl,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertCompany = `-- name: UpsertCompany :one
 INSERT INTO companies (name, name_normalized)
 VALUES ($1::text, $2::text)

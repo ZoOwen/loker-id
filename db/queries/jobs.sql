@@ -103,6 +103,10 @@ WHERE canonical_job_id IS NULL
   AND (sqlc.narg('mode')::work_mode IS NULL OR mode = sqlc.narg('mode')::work_mode)
   AND (sqlc.narg('level')::experience_level IS NULL OR level = sqlc.narg('level')::experience_level)
   AND (sqlc.narg('city')::text IS NULL OR location_city ILIKE sqlc.narg('city')::text)
+  -- 'simple' must match the config the search_vector trigger indexes
+  -- with (see migrations/001_init.sql) — querying with a different
+  -- config's stemming/stopword rules would silently stop matching.
+  AND (sqlc.narg('query')::text IS NULL OR search_vector @@ websearch_to_tsquery('simple', sqlc.narg('query')::text))
   AND (
     NOT sqlc.arg('has_cursor')::bool
     OR (COALESCE(posted_at, '-infinity'::timestamptz), id) <
@@ -116,3 +120,24 @@ UPDATE jobs
 SET is_active = FALSE
 WHERE is_active = TRUE
   AND last_seen_at < NOW() - (sqlc.arg('stale_after_days')::int * INTERVAL '1 day');
+
+-- name: GetJobByID :one
+SELECT * FROM jobs WHERE id = sqlc.arg('id')::uuid;
+
+-- name: ListDuplicatesOf :many
+-- Every duplicate of canonical_job_id, per our reparenting invariant
+-- (see ReparentDuplicates): always a flat one-level pointer, never a
+-- chain, so this alone is the complete set — no recursion needed.
+SELECT * FROM jobs WHERE canonical_job_id = sqlc.arg('canonical_job_id')::uuid ORDER BY first_seen_at ASC;
+
+-- name: CountActiveJobs :one
+SELECT count(*) FROM jobs WHERE is_active = TRUE AND canonical_job_id IS NULL;
+
+-- name: StackStats :many
+-- One row per technology across all active, canonical jobs, most common
+-- first. unnest() fans a job's stack array out into one row per element.
+SELECT unnest(stack)::text AS stack, count(*) AS job_count
+FROM jobs
+WHERE is_active = TRUE AND canonical_job_id IS NULL
+GROUP BY stack
+ORDER BY job_count DESC, stack ASC;

@@ -13,7 +13,10 @@ import (
 
 	"github.com/ZoOwen/loker-id/internal/config"
 	"github.com/ZoOwen/loker-id/internal/database"
+	"github.com/ZoOwen/loker-id/internal/pipeline"
+	"github.com/ZoOwen/loker-id/internal/scraper"
 	"github.com/ZoOwen/loker-id/internal/server"
+	"github.com/ZoOwen/loker-id/internal/store"
 )
 
 func main() {
@@ -37,7 +40,14 @@ func run() error {
 	}
 	defer pool.Close()
 
-	srv := server.New(pool)
+	st := store.New(pool)
+
+	scrapers := map[string]scraper.Scraper{
+		"kalibrr": scraper.NewKalibrrScraper(""),
+	}
+	pl := pipeline.New(st, scrapers, pipeline.Config{})
+
+	srv := server.New(pool, st, pl, cfg.InternalToken, slog.Default())
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,

@@ -11,6 +11,7 @@ import (
 )
 
 type Querier interface {
+	CountActiveJobs(ctx context.Context) (int64, error)
 	// Starts a run: the two-function lifecycle (Create/Finish) means there's
 	// no separate "pending" phase — by the time a run row is created, the
 	// scraper is about to start immediately.
@@ -24,6 +25,16 @@ type Querier interface {
 	// candidates, ordered oldest-first so the likely canonical sorts first.
 	FindDuplicateCandidates(ctx context.Context, arg FindDuplicateCandidatesParams) ([]Job, error)
 	FinishScrapeRun(ctx context.Context, arg FinishScrapeRunParams) error
+	GetJobByID(ctx context.Context, id uuid.UUID) (Job, error)
+	GetSourceBySlug(ctx context.Context, slug string) (Source, error)
+	// Batch lookup for enriching a page of jobs with their company's display
+	// name, e.g. in an HTTP handler — one query per page instead of one per
+	// row.
+	ListCompaniesByIDs(ctx context.Context, ids []uuid.UUID) ([]Company, error)
+	// Every duplicate of canonical_job_id, per our reparenting invariant
+	// (see ReparentDuplicates): always a flat one-level pointer, never a
+	// chain, so this alone is the complete set — no recursion needed.
+	ListDuplicatesOf(ctx context.Context, canonicalJobID uuid.UUID) ([]Job, error)
 	// Keyset pagination on (posted_at, id), both descending — never OFFSET.
 	// has_cursor distinguishes "first page" from "page after a row whose own
 	// posted_at happens to be NULL"; overloading cursor_posted_at itself as
@@ -40,6 +51,13 @@ type Querier interface {
 	// -> new canonical) instead of every duplicate pointing directly at the
 	// true canonical.
 	ReparentDuplicates(ctx context.Context, arg ReparentDuplicatesParams) error
+	// Per-source active job count (0 for a source with none, via LEFT JOIN)
+	// plus when it was last scraped, for GET /api/stats.
+	SourceStats(ctx context.Context) ([]SourceStatsRow, error)
+	// One row per technology across all active, canonical jobs, most common
+	// first. unnest() fans a job's stack array out into one row per element.
+	StackStats(ctx context.Context) ([]StackStatsRow, error)
+	UpdateSourceLastRunAt(ctx context.Context, id int32) error
 	// Inserts a company if name_normalized doesn't exist yet, otherwise
 	// refreshes its display name and returns the existing id — callers always
 	// get an id to attach jobs to, never an error over "already exists".

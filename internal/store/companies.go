@@ -22,3 +22,23 @@ func (s *Store) UpsertCompany(ctx context.Context, name, nameNormalized string) 
 	}
 	return id, nil
 }
+
+// CompanyNames batch-resolves company display names, for enriching a page
+// of jobs (which only carry a company_id) into an API response without an
+// N+1 query per row. Missing ids are simply absent from the result map.
+func (s *Store) CompanyNames(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if len(ids) == 0 {
+		return map[uuid.UUID]string{}, nil
+	}
+
+	companies, err := s.queries.ListCompaniesByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: list companies by ids: %w", err)
+	}
+
+	names := make(map[uuid.UUID]string, len(companies))
+	for _, c := range companies {
+		names[c.ID] = c.Name
+	}
+	return names, nil
+}

@@ -225,9 +225,6 @@ func TestListJobs_KeysetPaginationCoversEveryRowExactlyOnceInOrder(t *testing.T)
 		if err != nil {
 			t.Fatalf("ListJobs() error = %v", err)
 		}
-		if len(page) == 0 {
-			break
-		}
 		if len(page) > pageSize {
 			t.Fatalf("page returned %d rows, want at most %d", len(page), pageSize)
 		}
@@ -236,9 +233,9 @@ func TestListJobs_KeysetPaginationCoversEveryRowExactlyOnceInOrder(t *testing.T)
 			gotOrder = append(gotOrder, j.Title)
 		}
 
-		cursor = NextCursor(page)
-		if len(page) < pageSize {
-			break // short page: this was the last one
+		cursor = NextCursor(page, pageSize)
+		if cursor == nil {
+			break
 		}
 	}
 

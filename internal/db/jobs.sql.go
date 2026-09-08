@@ -12,6 +12,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveJobs = `-- name: CountActiveJobs :one
+SELECT count(*) FROM jobs WHERE is_active = TRUE AND canonical_job_id IS NULL
+`
+
+func (q *Queries) CountActiveJobs(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveJobs)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deactivateStaleJobs = `-- name: DeactivateStaleJobs :execrows
 UPDATE jobs
 SET is_active = FALSE
@@ -106,6 +117,96 @@ func (q *Queries) FindDuplicateCandidates(ctx context.Context, arg FindDuplicate
 	return items, nil
 }
 
+const getJobByID = `-- name: GetJobByID :one
+SELECT id, title, title_normalized, company_id, description, salary_min, salary_max, salary_currency, salary_conf, salary_raw, stack, location, location_city, mode, level, source_id, source_url, source_job_id, fingerprint, canonical_job_id, search_vector, posted_at, first_seen_at, last_seen_at, is_active FROM jobs WHERE id = $1::uuid
+`
+
+func (q *Queries) GetJobByID(ctx context.Context, id uuid.UUID) (Job, error) {
+	row := q.db.QueryRow(ctx, getJobByID, id)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.TitleNormalized,
+		&i.CompanyID,
+		&i.Description,
+		&i.SalaryMin,
+		&i.SalaryMax,
+		&i.SalaryCurrency,
+		&i.SalaryConf,
+		&i.SalaryRaw,
+		&i.Stack,
+		&i.Location,
+		&i.LocationCity,
+		&i.Mode,
+		&i.Level,
+		&i.SourceID,
+		&i.SourceUrl,
+		&i.SourceJobID,
+		&i.Fingerprint,
+		&i.CanonicalJobID,
+		&i.SearchVector,
+		&i.PostedAt,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.IsActive,
+	)
+	return i, err
+}
+
+const listDuplicatesOf = `-- name: ListDuplicatesOf :many
+SELECT id, title, title_normalized, company_id, description, salary_min, salary_max, salary_currency, salary_conf, salary_raw, stack, location, location_city, mode, level, source_id, source_url, source_job_id, fingerprint, canonical_job_id, search_vector, posted_at, first_seen_at, last_seen_at, is_active FROM jobs WHERE canonical_job_id = $1::uuid ORDER BY first_seen_at ASC
+`
+
+// Every duplicate of canonical_job_id, per our reparenting invariant
+// (see ReparentDuplicates): always a flat one-level pointer, never a
+// chain, so this alone is the complete set — no recursion needed.
+func (q *Queries) ListDuplicatesOf(ctx context.Context, canonicalJobID uuid.UUID) ([]Job, error) {
+	rows, err := q.db.Query(ctx, listDuplicatesOf, canonicalJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Job{}
+	for rows.Next() {
+		var i Job
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.TitleNormalized,
+			&i.CompanyID,
+			&i.Description,
+			&i.SalaryMin,
+			&i.SalaryMax,
+			&i.SalaryCurrency,
+			&i.SalaryConf,
+			&i.SalaryRaw,
+			&i.Stack,
+			&i.Location,
+			&i.LocationCity,
+			&i.Mode,
+			&i.Level,
+			&i.SourceID,
+			&i.SourceUrl,
+			&i.SourceJobID,
+			&i.Fingerprint,
+			&i.CanonicalJobID,
+			&i.SearchVector,
+			&i.PostedAt,
+			&i.FirstSeenAt,
+			&i.LastSeenAt,
+			&i.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJobs = `-- name: ListJobs :many
 SELECT id, title, title_normalized, company_id, description, salary_min, salary_max, salary_currency, salary_conf, salary_raw, stack, location, location_city, mode, level, source_id, source_url, source_job_id, fingerprint, canonical_job_id, search_vector, posted_at, first_seen_at, last_seen_at, is_active
 FROM jobs
@@ -120,13 +221,17 @@ WHERE canonical_job_id IS NULL
   AND ($3::work_mode IS NULL OR mode = $3::work_mode)
   AND ($4::experience_level IS NULL OR level = $4::experience_level)
   AND ($5::text IS NULL OR location_city ILIKE $5::text)
+  -- 'simple' must match the config the search_vector trigger indexes
+  -- with (see migrations/001_init.sql) — querying with a different
+  -- config's stemming/stopword rules would silently stop matching.
+  AND ($6::text IS NULL OR search_vector @@ websearch_to_tsquery('simple', $6::text))
   AND (
-    NOT $6::bool
+    NOT $7::bool
     OR (COALESCE(posted_at, '-infinity'::timestamptz), id) <
-       (COALESCE($7::timestamptz, '-infinity'::timestamptz), $8::uuid)
+       (COALESCE($8::timestamptz, '-infinity'::timestamptz), $9::uuid)
   )
 ORDER BY COALESCE(posted_at, '-infinity'::timestamptz) DESC, id DESC
-LIMIT $9::int
+LIMIT $10::int
 `
 
 type ListJobsParams struct {
@@ -135,6 +240,7 @@ type ListJobsParams struct {
 	Mode           NullWorkMode        `json:"mode"`
 	Level          NullExperienceLevel `json:"level"`
 	City           pgtype.Text         `json:"city"`
+	Query          pgtype.Text         `json:"query"`
 	HasCursor      bool                `json:"has_cursor"`
 	CursorPostedAt pgtype.Timestamptz  `json:"cursor_posted_at"`
 	CursorID       pgtype.UUID         `json:"cursor_id"`
@@ -155,6 +261,7 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, erro
 		arg.Mode,
 		arg.Level,
 		arg.City,
+		arg.Query,
 		arg.HasCursor,
 		arg.CursorPostedAt,
 		arg.CursorID,
@@ -240,6 +347,41 @@ type ReparentDuplicatesParams struct {
 func (q *Queries) ReparentDuplicates(ctx context.Context, arg ReparentDuplicatesParams) error {
 	_, err := q.db.Exec(ctx, reparentDuplicates, arg.NewCanonicalID, arg.OldCanonicalID)
 	return err
+}
+
+const stackStats = `-- name: StackStats :many
+SELECT unnest(stack)::text AS stack, count(*) AS job_count
+FROM jobs
+WHERE is_active = TRUE AND canonical_job_id IS NULL
+GROUP BY stack
+ORDER BY job_count DESC, stack ASC
+`
+
+type StackStatsRow struct {
+	Stack    string `json:"stack"`
+	JobCount int64  `json:"job_count"`
+}
+
+// One row per technology across all active, canonical jobs, most common
+// first. unnest() fans a job's stack array out into one row per element.
+func (q *Queries) StackStats(ctx context.Context) ([]StackStatsRow, error) {
+	rows, err := q.db.Query(ctx, stackStats)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []StackStatsRow{}
+	for rows.Next() {
+		var i StackStatsRow
+		if err := rows.Scan(&i.Stack, &i.JobCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertJob = `-- name: UpsertJob :one

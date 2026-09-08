@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/ZoOwen/loker-id/internal/db"
@@ -75,7 +76,7 @@ func (s *Store) UpsertJob(ctx context.Context, p UpsertJobParams) (UpsertJobResu
 		SalaryMax:       salaryMax,
 		SalaryConf:      db.SalaryConfidence(p.Salary.Conf),
 		SalaryRaw:       pgText(p.Salary.Raw),
-		Stack:           p.Stack,
+		Stack:           nonNilStrings(p.Stack),
 		Location:        pgText(p.Location),
 		LocationCity:    pgText(p.LocationCity),
 		Mode:            db.WorkMode(p.Mode),
@@ -116,6 +117,19 @@ func (s *Store) UpsertJob(ctx context.Context, p UpsertJobParams) (UpsertJobResu
 	return result, nil
 }
 
+// nonNilStrings coerces a nil slice to an empty one. jobs.stack is
+// NOT NULL DEFAULT '{}' — the default only applies when a column is
+// omitted from the INSERT entirely, not when it's explicitly bound to a
+// value, and pgx encodes a nil []string as SQL NULL, which the column
+// rejects. ExtractStack legitimately returns nil for a job matching none
+// of the curated tech list, so this isn't a hypothetical case.
+func nonNilStrings(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
 // salaryBoundsToDB translates parser.Salary's "0 means not stated"
 // convention into proper SQL NULLs: unknown salaries store neither bound,
 // and an estimated salary (only one side known) stores just that side.
@@ -149,15 +163,34 @@ const (
 	maxListLimit     = 100
 )
 
+// ClampLimit applies ListJobs' own bounds to a requested page size — a
+// caller that wants to know the *effective* limit up front (e.g. to tell
+// whether a page it got back was short, meaning definitively no more
+// results, via NextCursor) computes it the same way ListJobs does
+// internally.
+func ClampLimit(limit int32) int32 {
+	if limit <= 0 {
+		return defaultListLimit
+	}
+	if limit > maxListLimit {
+		return maxListLimit
+	}
+	return limit
+}
+
 // ListJobsFilter narrows ListJobs. A nil/zero field means "no filter" on
 // that dimension. Stack matching is "any of" (array overlap); SalaryMin
 // matches jobs whose salary_max clears the bar (see jobs.sql for why).
+// Query is free-text search over title/stack/description (see
+// search_vector in migrations/001_init.sql), parsed websearch-style
+// (supports "quoted phrases", OR, -exclusion).
 type ListJobsFilter struct {
 	Stack     []string
 	SalaryMin *int64
 	Mode      *normalizer.WorkMode
 	Level     *normalizer.ExperienceLevel
 	City      *string
+	Query     *string
 	Cursor    *Cursor
 	Limit     int32
 }
@@ -166,19 +199,14 @@ type ListJobsFilter struct {
 // first, using keyset pagination — never OFFSET. Pass NextCursor(result)
 // as the next call's filter.Cursor to get the following page.
 func (s *Store) ListJobs(ctx context.Context, filter ListJobsFilter) ([]db.Job, error) {
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = defaultListLimit
-	}
-	if limit > maxListLimit {
-		limit = maxListLimit
-	}
+	limit := ClampLimit(filter.Limit)
 
 	params := db.ListJobsParams{
 		Stack:     filter.Stack,
 		Mode:      nullWorkMode(filter.Mode),
 		Level:     nullExperienceLevel(filter.Level),
 		City:      nullPgText(filter.City),
+		Query:     nullPgText(filter.Query),
 		HasCursor: filter.Cursor != nil,
 		PageLimit: limit,
 	}
@@ -198,10 +226,16 @@ func (s *Store) ListJobs(ctx context.Context, filter ListJobsFilter) ([]db.Job, 
 }
 
 // NextCursor builds the cursor for the page after jobs (as returned by
-// ListJobs, which orders posted_at DESC, id DESC). Returns nil if jobs is
-// empty — there is no next page.
-func NextCursor(jobs []db.Job) *Cursor {
-	if len(jobs) == 0 {
+// ListJobs called with limit, which orders posted_at DESC, id DESC).
+// Returns nil if jobs is empty, or came back shorter than limit — a short
+// page conclusively means there's nothing more (ListJobs would have
+// filled it otherwise), so callers can trust a nil result instead of
+// needing an extra round trip that would just come back empty to confirm
+// it. Pass limit through store.ClampLimit first if the original request
+// didn't specify one (0) or exceeded the max — that's the effective limit
+// ListJobs actually applied.
+func NextCursor(jobs []db.Job, limit int32) *Cursor {
+	if len(jobs) == 0 || int32(len(jobs)) < limit {
 		return nil
 	}
 	last := jobs[len(jobs)-1]
@@ -232,6 +266,33 @@ func nullExperienceLevel(l *normalizer.ExperienceLevel) db.NullExperienceLevel {
 		return db.NullExperienceLevel{}
 	}
 	return db.NullExperienceLevel{ExperienceLevel: db.ExperienceLevel(*l), Valid: true}
+}
+
+// ErrJobNotFound is returned by GetJobByID when no job has that id.
+var ErrJobNotFound = errors.New("store: job not found")
+
+// GetJobByID fetches one job by id, regardless of its canonical status.
+func (s *Store) GetJobByID(ctx context.Context, id uuid.UUID) (db.Job, error) {
+	job, err := s.queries.GetJobByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.Job{}, ErrJobNotFound
+		}
+		return db.Job{}, fmt.Errorf("store: get job by id: %w", err)
+	}
+	return job, nil
+}
+
+// ListDuplicatesOf returns every job pointing at canonicalID, oldest
+// first. Empty if canonicalID has no duplicates, or is itself a
+// duplicate — duplicates never have their own sub-duplicates, since
+// ReparentDuplicates keeps every pointer flat.
+func (s *Store) ListDuplicatesOf(ctx context.Context, canonicalID uuid.UUID) ([]db.Job, error) {
+	jobs, err := s.queries.ListDuplicatesOf(ctx, canonicalID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list duplicates of %s: %w", canonicalID, err)
+	}
+	return jobs, nil
 }
 
 // MarkAsDuplicate is exposed directly (beyond the automatic resolution
