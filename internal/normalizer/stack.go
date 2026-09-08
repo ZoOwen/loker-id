@@ -171,6 +171,8 @@ var stackKeywords = []stackKeyword{
 	{"GitHub Actions", []matcher{word("github actions")}},
 	{"Elasticsearch", []matcher{word("elasticsearch"), word("elastic search")}},
 	{"Helm", []matcher{word("helm")}},
+	{"VMware", []matcher{word("vmware")}},
+	{"Hyper-V", []matcher{word("hyper-v"), word("hyperv")}},
 
 	{"GraphQL", []matcher{word("graphql")}},
 	{"RabbitMQ", []matcher{word("rabbitmq")}},

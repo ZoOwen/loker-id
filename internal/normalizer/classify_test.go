@@ -10,7 +10,9 @@ func TestDetectMode(t *testing.T) {
 		description string
 		want        WorkMode
 	}{
-		{"no signal at all", "Backend Developer", "Jakarta, Indonesia", "", ModeUnknown},
+		{"a clear location with no remote/hybrid/onsite keyword anywhere defaults to onsite", "Backend Developer", "Jakarta, Indonesia", "", ModeOnsite},
+		{"no location and no keyword anywhere is the only case left as unknown", "Backend Developer", "", "", ModeUnknown},
+		{"whitespace-only location counts as no location", "Backend Developer", "   ", "", ModeUnknown},
 		{"hybrid tag in location, as our own scraper produces it", "Software Engineer", "Bandung, Indonesia (Hybrid)", "", ModeHybrid},
 		{"remote tag in location", "Software Engineer", "Jakarta, Indonesia (Remote)", "", ModeRemote},
 		{"wfh keyword in description", "Software Engineer", "Jakarta, Indonesia", "Kandidat wajib WFH dari rumah", ModeRemote},
@@ -24,6 +26,7 @@ func TestDetectMode(t *testing.T) {
 		{"100% remote phrase", "Backend Engineer", "", "100% remote team, work from anywhere", ModeRemote},
 		{"remote-based phrase", "Backend Engineer", "", "Remote-based role, async first", ModeRemote},
 		{"kerja jarak jauh (Indonesian for remote work)", "Backend Engineer", "", "Sistem kerja jarak jauh diterapkan penuh", ModeRemote},
+		{"description content alone, with no location and no mode keyword, still stays unknown", "Backend Developer", "", "Great benefits and a fun team culture.", ModeUnknown},
 	}
 
 	for _, tt := range tests {
@@ -70,6 +73,17 @@ func TestDetectLevel(t *testing.T) {
 		{"title keyword wins over a conflicting description years hint", "Senior Backend Engineer", "1 year of experience required.", LevelSenior},
 		{"no years pattern in description at all stays unknown", "Backend Engineer", "We are a fast-growing startup looking for a great engineer.", LevelUnknown},
 		{"reversed phrasing: experience minimum N years -> senior", "Backend Engineer", "Experience: minimum 5 years in backend development.", LevelSenior},
+
+		// A real posting's exact wording: apostrophe in "year's", plural
+		// "experiences", and "More than" preceding the number.
+		{"real-world case: More than N year's experiences (apostrophe) -> mid", "Backend Engineer", "More than 3 year's experiences in backend development required.", LevelMid},
+		{"years' (apostrophe after s) also tolerated", "Backend Engineer", "More than 6 years' experience in software engineering.", LevelSenior},
+		{"standalone at least N years, no adjacent \"experience\" word -> mid", "Backend Engineer", "Candidates should have at least 3 years in a similar role.", LevelMid},
+		{"standalone minimum N years, no adjacent \"experience\" word -> junior", "Backend Engineer", "Minimum 1 year in a backend role.", LevelJunior},
+		{"standalone N+ years with no \"experience\" nearby at all -> senior", "Backend Engineer", "5+ years building distributed systems.", LevelSenior},
+		{"N+ years old (age, not experience) must NOT be picked up", "Backend Engineer", "Candidates must be 25+ years old to apply for this role.", LevelUnknown},
+		{"indonesian abbreviated: min. N tahun (with period) -> mid", "Backend Engineer", "Min. 3 tahun pengalaman di bidang terkait.", LevelMid},
+		{"indonesian abbreviated: min N tahun (no period) -> junior", "Backend Engineer", "Min 1 tahun pengalaman sebagai backend developer.", LevelJunior},
 	}
 
 	for _, tt := range tests {

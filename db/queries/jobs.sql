@@ -136,8 +136,21 @@ SELECT count(*) FROM jobs WHERE is_active = TRUE AND canonical_job_id IS NULL;
 -- name: StackStats :many
 -- One row per technology across all active, canonical jobs, most common
 -- first. unnest() fans a job's stack array out into one row per element.
-SELECT unnest(stack)::text AS stack, count(*) AS job_count
-FROM jobs
-WHERE is_active = TRUE AND canonical_job_id IS NULL
+-- The unnest has to happen in a subquery: naming its output column "stack"
+-- (matching the source jobs.stack array column) and then GROUP BY-ing that
+-- same name in the *same* query scope makes Postgres resolve it back to
+-- the original array column, not the unnested scalar — every job's whole
+-- array is then its own group, so two different jobs that share a
+-- technology never merge into one counted row (confirmed against a real
+-- Postgres: with that shape, {Go,Docker} and {Go,Kubernetes} in two jobs
+-- produced two separate "Go" rows, each count=1, instead of one row
+-- count=2). A subquery puts the unnested column in its own scope, where
+-- there's no longer a same-named array column for GROUP BY to prefer.
+SELECT stack, count(*) AS job_count
+FROM (
+    SELECT unnest(stack)::text AS stack
+    FROM jobs
+    WHERE is_active = TRUE AND canonical_job_id IS NULL
+) AS unnested
 GROUP BY stack
 ORDER BY job_count DESC, stack ASC;

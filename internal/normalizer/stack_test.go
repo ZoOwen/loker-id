@@ -131,6 +131,29 @@ func TestExtractStack(t *testing.T) {
 			"", "",
 			nil,
 		},
+		{
+			"virtualization platforms found in a real storage/backup infra posting",
+			"System Engineer", "Memahami konsep virtualisasi (VMware/Hyper-V) dan integrasinya dengan storage.",
+			[]string{"Hyper-V", "VMware"},
+		},
+
+		// --- real-world case: no stack should ever be forced when the
+		// description genuinely names no specific technology, only
+		// generic/soft-skill language. Verified against actual scraped
+		// postings before deciding this, not assumed — see the
+		// investigation for the by-request "stack: []" check. ---
+		{
+			"vague posting naming no actual technology, just repeating the job title",
+			"DevOps Engineer",
+			"We are hiring developers for projects with one of the biggest reputable conglomerates in Indonesia. Programming stack we are looking for: DevOps Engineer. Have experience working professionally for at least 2-4 years. Full remote work (WFH).",
+			nil,
+		},
+		{
+			"lead role described entirely in generic architecture/leadership terms, no named product anywhere",
+			"Lead Backend Engineer",
+			"Strong understanding of database technologies, including both SQL and NoSQL. Experience in system design, including building scalable, reliable, and fault-tolerant systems. Good understanding of software development lifecycle (SDLC) best practices.",
+			nil,
+		},
 	}
 
 	for _, tt := range tests {

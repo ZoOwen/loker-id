@@ -186,6 +186,16 @@ func TestStats(t *testing.T) {
 	phpJob.Stack = []string{"PHP"}
 	mustUpsert(t, s, phpJob)
 
+	// A second job also mentioning "Go" — sharing a technology across
+	// *different* jobs' arrays is exactly the case that caught a real
+	// GROUP BY bug: grouping by the array column itself (name-collision
+	// with the unnested alias) kept "Go" from job 1 and "Go" from job 2
+	// in separate groups, producing two count=1 rows instead of one
+	// count=2 row.
+	anotherGoJob := testJobParams(companyID, sourceID, "https://kalibrr.com/jobs/stats-go-2")
+	anotherGoJob.Stack = []string{"Go", "Docker"}
+	mustUpsert(t, s, anotherGoJob)
+
 	if err := s.UpdateSourceLastRunAt(ctx, sourceID); err != nil {
 		t.Fatalf("UpdateSourceLastRunAt() error = %v", err)
 	}
@@ -195,8 +205,8 @@ func TestStats(t *testing.T) {
 		t.Fatalf("Stats() error = %v", err)
 	}
 
-	if stats.TotalActive != 2 {
-		t.Errorf("TotalActive = %d, want 2", stats.TotalActive)
+	if stats.TotalActive != 3 {
+		t.Errorf("TotalActive = %d, want 3", stats.TotalActive)
 	}
 
 	var kalibrrStat *SourceStat
@@ -208,8 +218,8 @@ func TestStats(t *testing.T) {
 	if kalibrrStat == nil {
 		t.Fatal("kalibrr missing from BySource")
 	}
-	if kalibrrStat.ActiveJobs != 2 {
-		t.Errorf("kalibrr ActiveJobs = %d, want 2", kalibrrStat.ActiveJobs)
+	if kalibrrStat.ActiveJobs != 3 {
+		t.Errorf("kalibrr ActiveJobs = %d, want 3", kalibrrStat.ActiveJobs)
 	}
 	if kalibrrStat.LastRunAt == nil {
 		t.Error("kalibrr LastRunAt = nil, want set")
@@ -232,8 +242,19 @@ func TestStats(t *testing.T) {
 	for _, s := range stats.ByStack {
 		stackCounts[s.Stack] = s.JobCount
 	}
-	if stackCounts["Go"] != 1 || stackCounts["PostgreSQL"] != 1 || stackCounts["PHP"] != 1 {
-		t.Errorf("ByStack = %+v, want Go=1 PostgreSQL=1 PHP=1", stats.ByStack)
+	if stackCounts["Go"] != 2 || stackCounts["PostgreSQL"] != 1 || stackCounts["PHP"] != 1 || stackCounts["Docker"] != 1 {
+		t.Errorf("ByStack = %+v, want Go=2 PostgreSQL=1 PHP=1 Docker=1", stats.ByStack)
+	}
+	// Exactly one row per technology — no duplicate "Go" rows from the
+	// GROUP BY bug.
+	var goRows int
+	for _, s := range stats.ByStack {
+		if s.Stack == "Go" {
+			goRows++
+		}
+	}
+	if goRows != 1 {
+		t.Errorf("Go appears in ByStack %d times, want exactly 1 row (with job_count=2), got %+v", goRows, stats.ByStack)
 	}
 }
 

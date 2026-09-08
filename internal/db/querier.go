@@ -56,6 +56,16 @@ type Querier interface {
 	SourceStats(ctx context.Context) ([]SourceStatsRow, error)
 	// One row per technology across all active, canonical jobs, most common
 	// first. unnest() fans a job's stack array out into one row per element.
+	// The unnest has to happen in a subquery: naming its output column "stack"
+	// (matching the source jobs.stack array column) and then GROUP BY-ing that
+	// same name in the *same* query scope makes Postgres resolve it back to
+	// the original array column, not the unnested scalar — every job's whole
+	// array is then its own group, so two different jobs that share a
+	// technology never merge into one counted row (confirmed against a real
+	// Postgres: with that shape, {Go,Docker} and {Go,Kubernetes} in two jobs
+	// produced two separate "Go" rows, each count=1, instead of one row
+	// count=2). A subquery puts the unnested column in its own scope, where
+	// there's no longer a same-named array column for GROUP BY to prefer.
 	StackStats(ctx context.Context) ([]StackStatsRow, error)
 	UpdateSourceLastRunAt(ctx context.Context, id int32) error
 	// Inserts a company if name_normalized doesn't exist yet, otherwise
