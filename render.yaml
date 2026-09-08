@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: loker-id
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_ENV
+        value: production
+      # Render injects its own PORT for Docker web services and routes
+      # traffic to it — deliberately not set here. internal/config
+      # already reads PORT from the environment (see .env.example).
+      - key: DATABASE_URL
+        sync: false # Neon connection string, ?sslmode=require — set manually in the Render dashboard
+      - key: INTERNAL_TOKEN
+        sync: false # gates POST /internal/scrape — set manually in the Render dashboard
+      - key: DB_MAX_CONNS
+        value: "5" # see internal/database.NewPool — keep well under Neon free tier's connection limit

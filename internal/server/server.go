@@ -3,9 +3,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,6 +16,13 @@ import (
 	"github.com/ZoOwen/loker-id/internal/pipeline"
 	"github.com/ZoOwen/loker-id/internal/store"
 )
+
+// healthzDBTimeout bounds how long /healthz waits on the DB ping. Neon's
+// free tier scales to zero when idle, so the first query after a while
+// can take ~1s to wake it back up — well within this — while a genuinely
+// unreachable DB still fails the check in bounded time instead of hanging
+// on the incoming request's own (often unbounded) context.
+const healthzDBTimeout = 5 * time.Second
 
 type Server struct {
 	router        *chi.Mux
@@ -73,7 +82,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	body := map[string]string{"status": "ok"}
 
-	if err := s.db.Ping(r.Context()); err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), healthzDBTimeout)
+	defer cancel()
+
+	if err := s.db.Ping(ctx); err != nil {
 		status = http.StatusServiceUnavailable
 		body = map[string]string{"status": "db unreachable"}
 	}

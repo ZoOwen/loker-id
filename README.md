@@ -14,6 +14,35 @@ make test          # full test suite (needs TEST_DATABASE_URL — see .env.examp
 
 See `Makefile` for the rest of the targets (`sqlc`, `migrate-*`, `test-db-setup`).
 
+## Deploying to Render
+
+`render.yaml` is a blueprint for a Docker-based web service; `Dockerfile`
+builds a static binary (`CGO_ENABLED=0`, pure-Go deps only) on
+`golang:alpine` and runs it on `gcr.io/distroless/static-debian12`.
+
+- **Port**: Render assigns its own `PORT` for Docker services (not always
+  8080) and routes traffic to it. `internal/config` already reads `PORT`
+  from the environment, so nothing needs to change — just don't set `PORT`
+  yourself in the Render dashboard/blueprint, or you'd override what
+  Render assigns.
+- **DATABASE_URL / INTERNAL_TOKEN**: marked `sync: false` in
+  `render.yaml` — set them manually in the Render dashboard rather than
+  committing them. Neon's connection string must keep `?sslmode=require`
+  (see `.env.example`); pgx reads `sslmode` straight off the URL, so
+  there's no separate flag to set.
+- **Connection pool**: `internal/database.NewPool` caps the pgxpool at
+  `DB_MAX_CONNS` (env var, default 5 — see `.env.example`) instead of
+  pgxpool's own CPU-count-scaled default, to stay well under Neon
+  free-tier's connection limit.
+- **`/healthz`**: pings the DB with a 5s timeout, generous enough that
+  Neon's scale-to-zero cold start (~1s for the first query after being
+  idle) doesn't trip it, while a genuinely unreachable DB still fails the
+  check in bounded time.
+- **Migrations are not run automatically** by the image or the blueprint.
+  Apply `migrations/001_init.sql` to the Neon database yourself (`make
+  migrate-up` with `DATABASE_URL` pointed at Neon) before or after the
+  first deploy.
+
 ## API
 
 - `GET /api/jobs` — list active jobs, keyset-paginated, filterable by stack/salary/mode/level/city/query.

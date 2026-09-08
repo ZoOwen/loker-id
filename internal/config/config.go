@@ -4,15 +4,23 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/joho/godotenv"
 )
+
+// defaultDBMaxConns caps the pgxpool at a size a Neon free-tier project's
+// connection limit can absorb even with a couple of instances/deploys
+// overlapping, rather than pgxpool's own CPU-count-scaled default. See
+// database.NewPool.
+const defaultDBMaxConns = 5
 
 type Config struct {
 	AppEnv        string
 	Port          string
 	DatabaseURL   string
 	InternalToken string
+	DBMaxConns    int32
 }
 
 // Load reads configuration from the environment, loading a .env file first
@@ -25,6 +33,7 @@ func Load() (*Config, error) {
 		Port:          getEnv("PORT", "8080"),
 		DatabaseURL:   os.Getenv("DATABASE_URL"),
 		InternalToken: os.Getenv("INTERNAL_TOKEN"),
+		DBMaxConns:    getEnvInt("DB_MAX_CONNS", defaultDBMaxConns),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -46,4 +55,20 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvInt reads an integer env var, falling back (rather than failing
+// Load outright) on either an unset or a malformed value — this only ever
+// tunes a pool size, not something worth taking the whole app down over a
+// typo.
+func getEnvInt(key string, fallback int32) int32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return int32(n)
 }
