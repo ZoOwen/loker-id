@@ -1,0 +1,25 @@
+name: Keepalive
+
+# Render's free tier spins the service down after ~15 minutes of no
+# traffic; a cold start then costs the next real request a real delay.
+# Pinging every 10 minutes keeps it warm. --fail is deliberately NOT used
+# here: this job's only purpose is a best-effort ping, and a single slow
+# cold-start response timing out shouldn't turn the workflow red when the
+# next ping 10 minutes later will succeed anyway — scrape.yml is where a
+# failure actually needs to be loud.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz
+        run: |
+          curl -sS -o /dev/null -w "healthz responded %{http_code}\n" --max-time 60 \
+            "https://loker-id-api.onrender.com/healthz"

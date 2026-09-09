@@ -1,0 +1,25 @@
+name: Scheduled scrape
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /internal/scrape
+        env:
+          INTERNAL_TOKEN: ${{ secrets.INTERNAL_TOKEN }}
+        # --fail: a non-2xx response (e.g. a missing/rotated
+        # INTERNAL_TOKEN, or the service being down) makes curl exit
+        # non-zero, which fails this step and turns the workflow run red
+        # instead of silently doing nothing.
+        run: |
+          curl -sS --fail --max-time 60 -X POST \
+            -H "X-Internal-Token: ${INTERNAL_TOKEN}" \
+            "https://loker-id-api.onrender.com/internal/scrape?source=kalibrr"
