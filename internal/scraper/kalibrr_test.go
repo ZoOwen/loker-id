@@ -602,6 +602,21 @@ func TestKalibrrScraper_ContinuesToNextKeywordAfterOneFails(t *testing.T) {
 	}
 }
 
+// TestKalibrrScraper_ProductionHostIsTheIndonesiaDomain locks in the
+// actual fix for the country-lock incident (see the package doc comment
+// in kalibrr.go): kalibrr.com and kalibrr.co.id both return geo-IP-
+// dependent results regardless of the /id-ID locale prefix — verified by
+// a real production failure after the locale-prefix-only fix shipped.
+// Only the per-country domain (kalibrr.id) was confirmed, with a
+// same-IP/different-domain test, to be IP-independent. If this constant
+// ever gets "simplified" back to kalibrr.com, this is what should catch
+// it before a deploy does.
+func TestKalibrrScraper_ProductionHostIsTheIndonesiaDomain(t *testing.T) {
+	if kalibrrHost != "www.kalibrr.id" {
+		t.Errorf("kalibrrHost = %q, want %q", kalibrrHost, "www.kalibrr.id")
+	}
+}
+
 // TestKalibrrScraper_RequestsUseTheIndonesiaLocalePrefix guards the fix
 // for the 2026-09-09 production incident (see the package doc comment in
 // kalibrr.go): every request must carry the /id-ID locale prefix, which

@@ -62,46 +62,67 @@ import (
 // up in a run's numbers.
 //
 // The country these searches return is geo-IP-based, not fixed by
-// keyword or "te" search mode — a real production incident on 2026-09-09
-// (server deployed to Render's Singapore region) surfaced this: every
-// scraped job came back Filipino (Makati, Pasig, Quezon City...), zero
-// Indonesian, while the exact same code run from an Indonesia-resident IP
-// returned normal Indonesian listings. Confirmed directly against the
-// live site: every page's __NEXT_DATA__ carries
-// `props.pageProps.geoCountry` (e.g. {"country":"ID","actualCountry":
-// "ID"} when fetched from an Indonesia-geolocated IP) alongside Next.js's
-// own i18n metadata — `locale`/`locales`/`defaultLocale` — with exactly
-// two configured locales: "en" (default) and "id-ID". Kalibrr operates
-// separate country sites (kalibrr.com, kalibrr.id, kalibrr.ph — visible
-// in the page's own CSP header) and defaults the unprefixed route to
-// whichever country your request's IP geolocates to; Render's Singapore
-// egress IP apparently geolocates as the Philippines on Kalibrr's side
-// (or Cloudflare's, which fronts kalibrr.com — same effect either way).
+// keyword, "te" search mode, or (it turns out) the /id-ID locale prefix
+// this package tried first. Two rounds of a real production incident
+// (server deployed to Render's Singapore region) established that:
 //
-// The fix is kalibrrLocalePrefix: prefixing every request with /id-ID
-// (Next.js's built-in locale-routing path prefix, not a Kalibrr-specific
-// param) pins `locale = "id-ID"` server-side regardless of the requesting
-// IP's geolocation — verified by fetching
-// https://www.kalibrr.com/id-ID/job-board/te/backend/1 directly: it
-// 308-redirects to /id-ID/home/te/backend/1 (same redirect the
-// unprefixed route already gets — see above), returns
-// `"locale":"id-ID"` in __NEXT_DATA__, and every job's
-// googleLocation.addressComponents.country is "Indonesia". Because this
-// is standard Next.js URL-based locale resolution rather than anything
-// IP-dependent, it's expected to hold from any hosting region — but
-// checkKalibrrCountry (called from handleNextData) logs a warning if a
-// scrape ever comes back non-Indonesian anyway, so a regression here
-// (Kalibrr restructuring their locale routing, geoIP starting to
-// override the prefix, ...) surfaces immediately instead of silently
-// polluting the database again.
+//  1. First occurrence (2026-09-09): every scraped job came back
+//     Filipino (Makati, Pasig, Quezon City...), zero Indonesian, while
+//     the same code run from an Indonesia-resident IP was fine. The fix
+//     tried then was prefixing requests with /id-ID (Next.js's built-in
+//     locale-routing prefix — kalibrr.com serves exactly two locales,
+//     "en" and "id-ID"), verified by fetching that URL and confirming
+//     `"locale":"id-ID"` plus Indonesian job locations in the response.
+//  2. That "fix" then failed in production anyway: the very same
+//     www.kalibrr.com/id-ID/... URL returned wrong_country_jobs=15/15,
+//     all Philippines, from Render. The verification behind step 1 was
+//     methodologically broken — fetching /id-ID from a dev machine whose
+//     own IP already geolocates to Indonesia proves nothing about
+//     whether the prefix itself does anything; the locale prefix turned
+//     out to only ever have controlled the UI language, never which
+//     country's jobs get returned. geoCountry (still keyed off the
+//     request's IP) does.
+//
+// The mechanism that actually is IP-independent, verified with a test
+// that doesn't depend on this environment's own geolocation: Kalibrr
+// operates separate per-country domains, visible in the page's own CSP
+// header (kalibrr.com, kalibrr.id, kalibrr.ph, kalibrr.vn). Fetching
+// https://www.kalibrr.ph/job-board/te/backend/1 from this same
+// Indonesia-geolocated environment returned geoCountry
+// {"country":"PH","actualCountry":"PH"} and 15/15 Philippines jobs —
+// i.e. the exact same source IP got opposite-country results purely by
+// switching domains. That can only be explained by the domain driving
+// the result, not the request's IP, and by symmetry it means
+// www.kalibrr.id locks Indonesia the same way regardless of where the
+// request originates (Render Singapore included). kalibrr.co.id, tried
+// first as the more guessable candidate, turned out to just 308-redirect
+// to www.kalibrr.id — that redirect is followed fine (colly's default
+// http.Client behavior), but this scraper points at kalibrr.id directly
+// rather than relying on it. Re-verified on kalibrr.id that "te" keyword
+// search still works (count differs per keyword; a keyword search
+// without "te" ignores the keyword, same as on kalibrr.com) and that
+// pagination is equally broken there (offset stuck at 0 — see above),
+// so nothing else about this scraper's behavior needed to change.
+//
+// The /id-ID locale prefix is kept anyway — it's harmless, still genuine
+// Next.js locale routing, and one live check showed it reduces stray
+// non-Indonesia jobs to zero (vs. one leaking through on kalibrr.com/en
+// without it) — but it is not what makes this work; the domain is. Given
+// this mechanism has already been wrong once, checkKalibrrCountry (called
+// from handleNextData) logs a warning if a scrape ever comes back
+// non-Indonesian anyway, so a second regression surfaces from production
+// logs immediately instead of silently polluting the database again.
 const (
 	kalibrrSource = "kalibrr"
-	kalibrrHost   = "www.kalibrr.com"
-	kalibrrBase   = "https://" + kalibrrHost
+	// kalibrrHost is Kalibrr's Indonesia-specific domain — see the
+	// package doc comment above for why this, and not kalibrr.com, is
+	// what actually locks results to Indonesia.
+	kalibrrHost = "www.kalibrr.id"
+	kalibrrBase = "https://" + kalibrrHost
 
-	// kalibrrLocalePrefix pins every request to Kalibrr's Indonesia
-	// locale — see the package doc comment above for why this exists and
-	// how it was verified.
+	// kalibrrLocalePrefix sets Kalibrr's UI locale to Indonesian on top
+	// of kalibrrHost already locking the country — see the package doc
+	// comment above.
 	kalibrrLocalePrefix = "/id-ID"
 
 	// kalibrrExpectedCountry is what every job's
@@ -132,10 +153,11 @@ var DefaultKalibrrKeywords = []string{
 	"java", "php", "nodejs", "android", "ios",
 }
 
-// KalibrrScraper implements Scraper for kalibrr.com job listings, running
-// one search per keyword and aggregating the results (see the package doc
-// comment for why keywords, not pages, are how this scraper gets
-// coverage).
+// KalibrrScraper implements Scraper for Kalibrr's Indonesia job listings
+// (kalibrr.id — see the package doc comment for why that domain
+// specifically), running one search per keyword and aggregating the
+// results (see the package doc comment for why keywords, not pages, are
+// how this scraper gets coverage).
 type KalibrrScraper struct {
 	collector      *colly.Collector
 	baseURL        string
@@ -187,10 +209,10 @@ type kalibrrPageResult struct {
 	retryable bool
 }
 
-// NewKalibrrScraper builds a Scraper for kalibrr.com, running one search
-// per keyword given (e.g. "backend", "golang", "devops") and aggregating
-// the results. Called with no keywords, it searches DefaultKalibrrKeywords
-// instead.
+// NewKalibrrScraper builds a Scraper for Kalibrr's Indonesia listings,
+// running one search per keyword given (e.g. "backend", "golang",
+// "devops") and aggregating the results. Called with no keywords, it
+// searches DefaultKalibrrKeywords instead.
 func NewKalibrrScraper(keywords ...string) *KalibrrScraper {
 	cfg := defaultKalibrrConfig()
 	if len(keywords) > 0 {

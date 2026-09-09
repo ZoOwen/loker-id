@@ -74,23 +74,44 @@ If Kalibrr fixes their pagination, this scraper starts walking multiple
 pages per keyword automatically; nothing here assumes it's permanently
 broken, it's just not relied on.
 
-**Country lock.** Every request is prefixed with `/id-ID` (Next.js's own
-locale-routing path prefix). This exists because of a real incident: once
-deployed to Render's Singapore region, every scraped job came back
-Filipino (Makati, Pasig, Quezon City...) with zero Indonesian listings,
-while the same code run from an Indonesia-resident IP was fine. Kalibrr's
-unprefixed routes pick a country by geo-IP (confirmed via the page's own
-`__NEXT_DATA__`, which carries both a `geoCountry` field and Next.js's
-`locale`/`locales` metadata — exactly two configured locales, `en` and
-`id-ID`); Render's Singapore egress IP apparently geolocates as the
-Philippines on Kalibrr's (or Cloudflare's, which fronts kalibrr.com) side.
-The `/id-ID` prefix pins the locale server-side regardless of the
-requester's IP — verified by fetching it directly and checking both
-`__NEXT_DATA__.locale` and every job's country. See the doc comment on
-`kalibrrLocalePrefix` in `internal/scraper/kalibrr.go` for the full
-investigation. `checkKalibrrCountry` also logs a warning if a scrape ever
-comes back with a job outside Indonesia anyway, so a regression here
-surfaces immediately instead of silently polluting the database again.
+**Country lock.** `internal/scraper.KalibrrScraper` points at
+`www.kalibrr.id`, Kalibrr's Indonesia-specific domain — not
+`www.kalibrr.com`. This took two rounds of a real production incident to
+land on:
+
+1. Deployed to Render's Singapore region, every scraped job came back
+   Filipino (Makati, Pasig, Quezon City...), zero Indonesian, while the
+   same code run from an Indonesia-resident IP was fine. The first fix
+   tried was prefixing requests with `/id-ID` (Next.js's own
+   locale-routing path prefix; kalibrr.com serves exactly two locales,
+   `en` and `id-ID`), "verified" by fetching that URL and seeing
+   Indonesian jobs come back.
+2. That verification was invalid — fetching `/id-ID` from a machine whose
+   own IP already geolocates to Indonesia proves nothing about whether
+   the prefix does anything — and the fix duly failed in production: the
+   exact same `.../id-ID/...` URL came back `wrong_country_jobs: 15/15`,
+   all Philippines, from Render. The locale prefix only ever controlled
+   UI language; `geoCountry` (keyed off the request's IP) decided which
+   country's jobs get returned.
+
+The domain is what's actually IP-independent, confirmed with a test that
+doesn't depend on any one environment's own geolocation: fetching
+`kalibrr.ph` from this Indonesia-geolocated environment returned
+Philippines jobs — the same source IP got opposite-country results purely
+by switching domains, which can only be explained by the domain driving
+the result. By that same logic, `kalibrr.id` locks Indonesia regardless
+of where the request originates. (`kalibrr.co.id`, the more guessable
+candidate, turned out to just redirect to `kalibrr.id`.) The `/id-ID`
+prefix is kept on top of the domain — harmless, and one check showed it
+reduces stray non-Indonesia jobs to zero — but it is not what makes this
+work.
+
+Full investigation trail in the doc comment on `kalibrrHost` in
+`internal/scraper/kalibrr.go`. Given this mechanism has already been
+wrong once, `checkKalibrrCountry` logs a warning if a scrape ever comes
+back with a job outside Indonesia anyway, so a second regression surfaces
+from production logs immediately instead of silently polluting the
+database again.
 
 One consequence: the same real posting routinely surfaces under more than
 one keyword (e.g. a Go backend role matches both "backend" and "golang").
